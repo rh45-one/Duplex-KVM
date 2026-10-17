@@ -220,6 +220,9 @@ unsafe extern "C" fn on_telemetry_tick(_data: *mut c_void) -> c_int {
             "OFF"
         };
 
+        let safe_mode_label = snap.mode_label.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let safe_mode_sub = snap.mode_subtitle.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+
         let markup = format!(
             "<span size=\"large\" weight=\"bold\" foreground=\"#38bdf8\">{mode_label}</span>\n\
              <span foreground=\"#94a3b8\">{mode_sub}</span>\n\n\
@@ -231,8 +234,8 @@ unsafe extern "C" fn on_telemetry_tick(_data: *mut c_void) -> c_int {
              <tt>HID Batches (TX/RX) : </tt><b>{tx_hid}</b> / <b>{rx_hid}</b>  <span foreground=\"#94a3b8\">(UDP 48100 DSCP EF 0xB8)</span>\n\
              <tt>Video Frames (TX/RX): </tt><b>{tx_vid}</b> / <b>{rx_vid}</b>  <span foreground=\"#94a3b8\">(UDP 48102-3 DSCP AF41 0x88)</span>\n\
              <tt>PLI Keyframe Recover: </tt><b>{pli}</b>",
-            mode_label = snap.mode_label,
-            mode_sub = snap.mode_subtitle,
+            mode_label = safe_mode_label,
+            mode_sub = safe_mode_sub,
             vdisp = snap.virtual_displays_active,
             d_age = snap.daemon_age_ms,
             p_age = snap.peer_age_ms,

@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 const EV_SYN: u16 = 0x00;
 const EV_KEY: u16 = 0x01;
 const EV_REL: u16 = 0x02;
+const EV_ABS: u16 = 0x03;
 
 const SYN_REPORT: u16 = 0;
 
@@ -29,11 +30,15 @@ const REL_Y: u16 = 0x01;
 const REL_HWHEEL: u16 = 0x06;
 const REL_WHEEL: u16 = 0x08;
 
+const ABS_X: u16 = 0x00;
+const ABS_Y: u16 = 0x01;
+
 const BTN_LEFT: u16 = 0x110;
 const BTN_RIGHT: u16 = 0x111;
 const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
+const BTN_TOUCH: u16 = 0x14A;
 
 // Linux ioctl encodings for evdev ('E' = 0x45) and uinput ('U' = 0x55)
 const EVIOCGID: libc::c_ulong = 0x8008_4502;
@@ -345,6 +350,9 @@ pub struct LinuxInputBackend {
     rel_dy_accum: i16,
     rel_vwheel_accum: i16,
     rel_hwheel_accum: i16,
+    touchpad_touch_active: bool,
+    touchpad_last_x: Option<i32>,
+    touchpad_last_y: Option<i32>,
 }
 
 impl LinuxInputBackend {
@@ -376,6 +384,9 @@ impl LinuxInputBackend {
             rel_dy_accum: 0,
             rel_vwheel_accum: 0,
             rel_hwheel_accum: 0,
+            touchpad_touch_active: false,
+            touchpad_last_x: None,
+            touchpad_last_y: None,
         })
     }
 
@@ -448,6 +459,9 @@ impl InputBackend for LinuxInputBackend {
     fn start_capture(&mut self) -> Result<(), PalError> {
         self.stop_capture()?;
         self.panic_detector.reset();
+        self.touchpad_touch_active = false;
+        self.touchpad_last_x = None;
+        self.touchpad_last_y = None;
 
         let entries = fs::read_dir("/dev/input")
             .map_err(|e| PalError::Input(format!("Failed to read /dev/input: {e}")))?;
@@ -489,6 +503,9 @@ impl InputBackend for LinuxInputBackend {
         }
 
         if let Some(ref shm) = self.shm {
+            let now = monotonic_now_ns();
+            shm.block().beat_daemon(now);
+            shm.block().beat_peer(now.saturating_add(1_000_000_000));
             shm.block().input_grab_active.store(true, Ordering::Release);
         }
 
@@ -508,6 +525,9 @@ impl InputBackend for LinuxInputBackend {
             // `dev` drops here, immediately executing `ioctl(fd, EVIOCGRAB, 0)` and `close(fd)`.
         }
         self.panic_detector.reset();
+        self.touchpad_touch_active = false;
+        self.touchpad_last_x = None;
+        self.touchpad_last_y = None;
         if let Some(ref shm) = self.shm {
             shm.block()
                 .input_grab_active
@@ -575,6 +595,15 @@ impl InputBackend for LinuxInputBackend {
                             }
                             let pressed = ev.value == 1;
 
+                            if ev.code == BTN_TOUCH {
+                                self.touchpad_touch_active = pressed;
+                                if !pressed {
+                                    self.touchpad_last_x = None;
+                                    self.touchpad_last_y = None;
+                                }
+                                continue;
+                            }
+
                             // Check mouse buttons first
                             let mouse_btn = match ev.code {
                                 BTN_LEFT => Some(HidMouseButton::Left),
@@ -629,6 +658,31 @@ impl InputBackend for LinuxInputBackend {
                             REL_HWHEEL => {
                                 self.rel_hwheel_accum =
                                     self.rel_hwheel_accum.saturating_add(ev.value as i16);
+                            }
+                            _ => {}
+                        },
+                        EV_ABS => match ev.code {
+                            ABS_X => {
+                                if self.touchpad_touch_active {
+                                    if let Some(prev_x) = self.touchpad_last_x {
+                                        let delta = ((ev.value - prev_x) / 2)
+                                            .clamp(i16::MIN as i32, i16::MAX as i32)
+                                            as i16;
+                                        self.rel_dx_accum = self.rel_dx_accum.saturating_add(delta);
+                                    }
+                                    self.touchpad_last_x = Some(ev.value);
+                                }
+                            }
+                            ABS_Y => {
+                                if self.touchpad_touch_active {
+                                    if let Some(prev_y) = self.touchpad_last_y {
+                                        let delta = ((ev.value - prev_y) / 2)
+                                            .clamp(i16::MIN as i32, i16::MAX as i32)
+                                            as i16;
+                                        self.rel_dy_accum = self.rel_dy_accum.saturating_add(delta);
+                                    }
+                                    self.touchpad_last_y = Some(ev.value);
+                                }
                             }
                             _ => {}
                         },

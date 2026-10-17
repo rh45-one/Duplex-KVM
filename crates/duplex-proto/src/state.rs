@@ -184,6 +184,13 @@ impl ModeStateMachine {
         self.epoch
     }
 
+    #[inline]
+    pub fn sync_epoch(&mut self, peer_epoch: u64) {
+        if peer_epoch > self.epoch {
+            self.epoch = peer_epoch;
+        }
+    }
+
     /// Transitions the state machine. Emergency transitions (`HardwarePanicEscape`, `WatchdogTimeout`)
     /// unconditionally force `Mode0Idle` without waiting for network acknowledgment.
     pub fn transition(
@@ -191,12 +198,34 @@ impl ModeStateMachine {
         target: OperationalMode,
         reason: TransitionReason,
     ) -> Result<OperationalMode, StateMachineError> {
+        self.transition_with_epoch(target, reason, None)
+    }
+
+    /// Transitions the state machine, optionally adopting `peer_epoch` when triggered by a remote peer
+    /// so both peers converge on the exact same `epoch` without ping-ponging.
+    pub fn transition_with_epoch(
+        &mut self,
+        target: OperationalMode,
+        reason: TransitionReason,
+        peer_epoch: Option<u64>,
+    ) -> Result<OperationalMode, StateMachineError> {
         if matches!(
             reason,
             TransitionReason::HardwarePanicEscape | TransitionReason::WatchdogTimeout
         ) {
             self.current = OperationalMode::Mode0Idle;
-            self.epoch = self.epoch.wrapping_add(1);
+            self.epoch = match peer_epoch {
+                Some(pe) => self.epoch.max(pe),
+                None => self.epoch.wrapping_add(1),
+            };
+            return Ok(self.current);
+        }
+
+        if let Some(pe) = peer_epoch {
+            if pe > self.epoch {
+                self.epoch = pe;
+            }
+            self.current = target;
             return Ok(self.current);
         }
 

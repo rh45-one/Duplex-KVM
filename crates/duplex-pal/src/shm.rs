@@ -141,7 +141,7 @@ impl ShmWatchdog {
             libc::O_RDWR
         };
 
-        let fd = unsafe { libc::shm_open(c_name.as_ptr(), flags, 0o660) };
+        let fd = unsafe { libc::shm_open(c_name.as_ptr(), flags, 0o666) };
         if fd < 0 {
             return Err(PalError::SharedMemory(format!(
                 "shm_open({}) failed: {}",
@@ -152,6 +152,9 @@ impl ShmWatchdog {
 
         let size = core::mem::size_of::<ShmWatchdogBlock>();
         if create_and_init {
+            unsafe {
+                let _ = libc::fchmod(fd, 0o666);
+            }
             let rc = unsafe { libc::ftruncate(fd, size as libc::off_t) };
             if rc != 0 {
                 unsafe { libc::close(fd) };

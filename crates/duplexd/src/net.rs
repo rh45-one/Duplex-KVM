@@ -15,7 +15,7 @@ use duplex_proto::{
     DEBIAN_LAPTOP_IPV4, PEER_HEARTBEAT_INTERVAL_NS, PORT_CONTROL_TCP, PORT_HID_UDP,
     PORT_VIDEO_STREAM_0_UDP, PORT_VIDEO_STREAM_1_UDP, WINDOWS_HOST_IPV4,
 };
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
 use tracing::{debug, info, warn};
 
@@ -260,25 +260,17 @@ impl DuplexTransport {
     }
 
     /// Broadcasts a control payload (`Heartbeat`, `HeartbeatAck`, `ModeTransition`, `AdvertiseDisplays`, `VideoKeyframeRequest`)
-    /// over the CS6 control channel.
+    /// over the CS6 control channel (`UDP 48101`, `DSCP CS6 0xC0`).
     pub fn send_control_payload(&mut self, payload: &WirePayload) -> Result<(), PalError> {
         self.ctrl_crypto
             .seal_frame_into(payload, &mut self.tx_scratch)
             .map_err(|e| PalError::Network(format!("Control seal_frame_into failed: {e}")))?;
 
         let _ = self.ctrl_udp.send_to(&self.tx_scratch, self.peer_ctrl_addr);
-
-        if let Some(ref mut stream) = self.ctrl_tcp_stream {
-            let len = self.tx_scratch.len() as u16;
-            let header = len.to_be_bytes();
-            if stream.write_all(&header).is_err() || stream.write_all(&self.tx_scratch).is_err() {
-                self.ctrl_tcp_stream = None;
-            }
-        }
         Ok(())
     }
 
-    /// Sends a mode transition notification to the peer.
+    /// Sends a 3-datagram high-reliability mode transition burst to the peer (each with a fresh sequence number).
     pub fn send_mode_transition(
         &mut self,
         target_mode: OperationalMode,
@@ -290,7 +282,9 @@ impl DuplexTransport {
             reason,
             epoch,
         };
-        let _ = self.send_control_payload(&msg);
+        for _ in 0..3 {
+            let _ = self.send_control_payload(&msg);
+        }
     }
 
     /// Non-blocking 50 Hz (`20ms`) heartbeat transmitter & TCP connection maintenance.

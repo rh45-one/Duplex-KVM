@@ -163,6 +163,7 @@ fn apply_mode_transition(
     state_machine: &mut ModeStateMachine,
     target_mode: OperationalMode,
     reason: TransitionReason,
+    peer_epoch: Option<u64>,
     shm: &Arc<ShmWatchdog>,
     input_pal: &mut dyn InputBackend,
     display_pal: &mut dyn VirtualDisplayBackend,
@@ -173,16 +174,20 @@ fn apply_mode_transition(
     notify_peer: bool,
 ) {
     let previous_mode = state_machine.current_mode();
-    let effective_target = match state_machine.transition(target_mode, reason) {
-        Ok(mode) => mode,
-        Err(e) => {
-            warn!("State machine transition error: {e}");
-            return;
-        }
-    };
+    let effective_target =
+        match state_machine.transition_with_epoch(target_mode, reason, peer_epoch) {
+            Ok(mode) => mode,
+            Err(e) => {
+                warn!("State machine transition error: {e}");
+                return;
+            }
+        };
 
     let now_ns = monotonic_now_ns();
     let block = shm.block();
+    block.beat_daemon(now_ns);
+    // Grant a 1.5s transition grace window so duplex-guard does not trip while both peers configure displays/pipelines
+    block.beat_peer(now_ns.saturating_add(1_500_000_000));
 
     // If we were previously capturing input and are leaving capture mode, flush remote modifiers
     if previous_mode.should_capture_input(role) && !effective_target.should_capture_input(role) {
@@ -191,33 +196,34 @@ fn apply_mode_transition(
         }
     }
 
-    if notify_peer {
-        if let Some(ref mut net_tx) = transport {
-            net_tx.send_mode_transition(effective_target, reason, state_machine.epoch());
+    // When returning to Mode0Idle, disarm the watchdog and notify the peer BEFORE running
+    // kernel EVIOCGRAB release / xrandr teardown so neither side trips a 250ms timeout during cleanup.
+    if effective_target == OperationalMode::Mode0Idle {
+        block
+            .active_mode
+            .store(OperationalMode::Mode0Idle.as_u8(), Ordering::SeqCst);
+        block.input_grab_active.store(false, Ordering::SeqCst);
+        block.virtual_displays_active.store(0, Ordering::SeqCst);
+        if notify_peer {
+            if let Some(ref mut net_tx) = transport {
+                net_tx.send_mode_transition(effective_target, reason, state_machine.epoch());
+                let _ = net_tx.send_control_payload(&WirePayload::Heartbeat {
+                    sender_role: role,
+                    active_mode: effective_target,
+                    epoch: state_machine.epoch(),
+                    sender_timestamp_ns: now_ns,
+                });
+            }
         }
     }
 
     // Always sanitize local depressed keys across any mode change
     let _ = input_pal.release_all_stuck_keys();
-
-    if effective_target.should_capture_input(role) {
-        block.beat_peer(now_ns);
-        if let Err(e) = input_pal.start_capture() {
-            error!("Failed to start input capture for {effective_target:?}: {e}");
-            let _ = state_machine.transition(
-                OperationalMode::Mode0Idle,
-                TransitionReason::HardwarePanicEscape,
-            );
-            block
-                .active_mode
-                .store(OperationalMode::Mode0Idle.as_u8(), Ordering::SeqCst);
-            return;
-        }
-    } else {
+    if !effective_target.should_capture_input(role) {
         let _ = input_pal.stop_capture();
     }
 
-    // Synchronize virtual displays, hardware video encoder/viewer pipelines, and window rescue
+    // Synchronize virtual displays, hardware video encoder/viewer pipelines, and window rescue BEFORE grabbing input
     let required_vdisplays = effective_target.required_virtual_displays(role);
     let expected_viewers = effective_target.expected_incoming_video_streams(role);
 
@@ -234,7 +240,9 @@ fn apply_mode_transition(
             warn!("VideoPipelineBackend start_sender reported warning: {e}");
         }
     } else if expected_viewers > 0 {
-        let _ = display_pal.destroy_all_virtual_displays();
+        if !display_pal.active_virtual_displays().is_empty() {
+            let _ = display_pal.destroy_all_virtual_displays();
+        }
         block.virtual_displays_active.store(0, Ordering::Release);
 
         let viewer_specs = build_target_display_specs(expected_viewers, local_physical_displays);
@@ -250,13 +258,52 @@ fn apply_mode_transition(
         }
     } else {
         let _ = video_pal.close_all_viewer_windows();
-        let _ = display_pal.destroy_all_virtual_displays();
+        if !display_pal.active_virtual_displays().is_empty() {
+            let _ = display_pal.destroy_all_virtual_displays();
+        }
         block.virtual_displays_active.store(0, Ordering::Release);
     }
 
+    // Refresh heartbeats right before acquiring exclusive input grab so duplex-guard sees fresh timestamps
+    let pre_grab_ns = monotonic_now_ns();
+    block.beat_daemon(pre_grab_ns);
+    block.beat_peer(pre_grab_ns.saturating_add(1_000_000_000));
+
+    if effective_target.should_capture_input(role) {
+        if let Err(e) = input_pal.start_capture() {
+            error!("Failed to start input capture for {effective_target:?}: {e}");
+            let _ = state_machine.transition(
+                OperationalMode::Mode0Idle,
+                TransitionReason::HardwarePanicEscape,
+            );
+            block
+                .active_mode
+                .store(OperationalMode::Mode0Idle.as_u8(), Ordering::SeqCst);
+            return;
+        }
+    }
+
+    let post_grab_ns = monotonic_now_ns();
+    block.beat_daemon(post_grab_ns);
+    block.beat_peer(post_grab_ns.saturating_add(1_000_000_000));
     block
         .active_mode
         .store(effective_target.as_u8(), Ordering::SeqCst);
+
+    // When entering an active mode, notify peer AFTER local display/video/input transition has finished
+    // so the peer immediately receives uninterrupted 50 Hz heartbeats without any transition stall gap.
+    if notify_peer && effective_target != OperationalMode::Mode0Idle {
+        if let Some(ref mut net_tx) = transport {
+            net_tx.send_mode_transition(effective_target, reason, state_machine.epoch());
+            let _ = net_tx.send_control_payload(&WirePayload::Heartbeat {
+                sender_role: role,
+                active_mode: effective_target,
+                epoch: state_machine.epoch(),
+                sender_timestamp_ns: post_grab_ns,
+            });
+        }
+    }
+
     info!(
         from = ?previous_mode,
         to = ?effective_target,
@@ -406,15 +453,35 @@ pub fn run_daemon_with_args(args: &[String]) {
         return;
     }
 
+    let main_loop_progress_ns = Arc::new(core::sync::atomic::AtomicU64::new(monotonic_now_ns()));
+    {
+        let shm_bg = shm.clone();
+        let progress_bg = main_loop_progress_ns.clone();
+        let _ = thread::Builder::new()
+            .name("duplexd-hb-keeper".to_string())
+            .spawn(move || loop {
+                let now = monotonic_now_ns();
+                let last_progress = progress_bg.load(Ordering::Acquire);
+                // Keep the 250ms SHM daemon heartbeat fresh while the main loop is executing
+                // synchronous xrandr/GStreamer/EVIOCGRAB mode transitions (up to 3s stall cap).
+                if now.saturating_sub(last_progress) <= 3_000_000_000 {
+                    shm_bg.block().beat_daemon(now);
+                }
+                thread::sleep(Duration::from_millis(20));
+            });
+    }
+
     let mut captured_buf: Vec<CapturedInputEvent> = Vec::with_capacity(64);
     let mut outgoing_hid_buf: Vec<HidEvent> = Vec::with_capacity(64);
     let mut incoming_payloads: Vec<WirePayload> = Vec::with_capacity(32);
     let mut encoded_video_buf: Vec<EncodedVideoFrame> = Vec::with_capacity(8);
     let mut incoming_video_buf: Vec<EncodedVideoFrame> = Vec::with_capacity(8);
     let mut pli_monitors_buf: Vec<u8> = Vec::with_capacity(4);
+    let mut last_local_transition_ns: u64 = 0;
 
     loop {
         let now_ns = monotonic_now_ns();
+        main_loop_progress_ns.store(now_ns, Ordering::Release);
         let block = shm.block();
         block.beat_daemon(now_ns);
 
@@ -453,11 +520,13 @@ pub fn run_daemon_with_args(args: &[String]) {
         // 1. Check if duplex-guard requested an emergency reset
         if block.force_reset_requested.swap(false, Ordering::AcqRel) {
             warn!("Received emergency reset signal from duplex-guard; reverting to MODE_0_IDLE");
+            last_local_transition_ns = now_ns;
             apply_mode_transition(
                 cfg.role,
                 &mut state_machine,
                 OperationalMode::Mode0Idle,
                 TransitionReason::WatchdogTimeout,
+                None,
                 &shm,
                 input_pal.as_mut(),
                 display_pal.as_mut(),
@@ -469,15 +538,17 @@ pub fn run_daemon_with_args(args: &[String]) {
             );
         }
 
-        // 2. Check if duplex-ctl requested an operator mode transition via shared memory
+        // 2. Check if duplex-ctl / GUI requested an operator mode transition via shared memory
         let req = block.requested_mode.swap(NO_REQUESTED_MODE, Ordering::AcqRel);
         if req != NO_REQUESTED_MODE {
             let target_mode = OperationalMode::from_u8_lossy(req);
+            last_local_transition_ns = now_ns;
             apply_mode_transition(
                 cfg.role,
                 &mut state_machine,
                 target_mode,
                 TransitionReason::OperatorCommand,
+                None,
                 &shm,
                 input_pal.as_mut(),
                 display_pal.as_mut(),
@@ -522,6 +593,7 @@ pub fn run_daemon_with_args(args: &[String]) {
                 ?kind,
                 "Hardware panic escape sequence detected! Flushing remote modifiers and reverting to MODE_0_IDLE"
             );
+            last_local_transition_ns = now_ns;
             if let Some(ref mut net_tx) = transport {
                 net_tx.send_emergency_modifier_flush(now_ns);
             }
@@ -530,6 +602,7 @@ pub fn run_daemon_with_args(args: &[String]) {
                 &mut state_machine,
                 OperationalMode::Mode0Idle,
                 TransitionReason::HardwarePanicEscape,
+                None,
                 &shm,
                 input_pal.as_mut(),
                 display_pal.as_mut(),
@@ -618,21 +691,17 @@ pub fn run_daemon_with_args(args: &[String]) {
                     ..
                 } => {
                     block.beat_peer(now_ns);
-                    if let Some(ref mut net_io) = transport {
-                        let ack = WirePayload::HeartbeatAck {
-                            origin_timestamp_ns: sender_timestamp_ns,
-                            active_mode: state_machine.current_mode(),
-                            epoch: state_machine.epoch(),
-                        };
-                        let _ = net_io.send_control_payload(&ack);
-                    }
-                    if epoch > state_machine.epoch() && active_mode != state_machine.current_mode()
+                    if active_mode == state_machine.current_mode() {
+                        state_machine.sync_epoch(epoch);
+                    } else if epoch > state_machine.epoch()
+                        && now_ns.saturating_sub(last_local_transition_ns) > 1_000_000_000
                     {
                         apply_mode_transition(
                             cfg.role,
                             &mut state_machine,
                             active_mode,
                             TransitionReason::PeerRequest,
+                            Some(epoch),
                             &shm,
                             input_pal.as_mut(),
                             display_pal.as_mut(),
@@ -643,19 +712,31 @@ pub fn run_daemon_with_args(args: &[String]) {
                             false,
                         );
                     }
+                    if let Some(ref mut net_io) = transport {
+                        let ack = WirePayload::HeartbeatAck {
+                            origin_timestamp_ns: sender_timestamp_ns,
+                            active_mode: state_machine.current_mode(),
+                            epoch: state_machine.epoch(),
+                        };
+                        let _ = net_io.send_control_payload(&ack);
+                    }
                 }
                 WirePayload::HeartbeatAck {
                     origin_timestamp_ns,
-                    ..
+                    active_mode,
+                    epoch,
                 } => {
                     block.beat_peer(now_ns);
+                    if active_mode == state_machine.current_mode() {
+                        state_machine.sync_epoch(epoch);
+                    }
                     let rtt_ns = now_ns.saturating_sub(origin_timestamp_ns);
                     block.record_rtt_sample(rtt_ns);
                 }
                 WirePayload::ModeTransition {
                     target_mode,
                     reason,
-                    ..
+                    epoch,
                 } => {
                     block.beat_peer(now_ns);
                     apply_mode_transition(
@@ -663,6 +744,7 @@ pub fn run_daemon_with_args(args: &[String]) {
                         &mut state_machine,
                         target_mode,
                         reason,
+                        Some(epoch),
                         &shm,
                         input_pal.as_mut(),
                         display_pal.as_mut(),

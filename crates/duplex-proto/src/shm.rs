@@ -120,12 +120,12 @@ impl ShmWatchdogBlock {
 
     #[inline]
     pub fn beat_daemon(&self, now_ns: u64) {
-        self.daemon_heartbeat_ns.store(now_ns, Ordering::Release);
+        self.daemon_heartbeat_ns.fetch_max(now_ns, Ordering::AcqRel);
     }
 
     #[inline]
     pub fn beat_peer(&self, now_ns: u64) {
-        self.peer_heartbeat_ns.store(now_ns, Ordering::Release);
+        self.peer_heartbeat_ns.fetch_max(now_ns, Ordering::AcqRel);
     }
 
     /// Atomically sets or clears a bit in the shared-memory depressed-key bitmap.

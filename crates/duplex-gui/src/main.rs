@@ -58,13 +58,13 @@ impl TelemetrySnapshot {
         match mode {
             OperationalMode::Mode0Idle => (
                 "MODE 0: IDLE (LOCAL ONLY)",
-                "Local peripherals & displays independent; 1GbE internet passthrough active",
+                "Local peripherals and displays independent; 1GbE internet passthrough active",
             ),
             OperationalMode::Mode1PcPrimary {
                 extend_display: false,
             } => (
                 "MODE 1: PC PRIMARY (KVM INPUT ONLY)",
-                "Debian Laptop keyboard & trackpad control Windows 11 Desktop",
+                "Debian Laptop keyboard and trackpad control Windows 11 Desktop",
             ),
             OperationalMode::Mode1PcPrimary {
                 extend_display: true,
@@ -74,7 +74,7 @@ impl TelemetrySnapshot {
             ),
             OperationalMode::Mode2LaptopPrimary => (
                 "MODE 2: LAPTOP PRIMARY (DUAL-MONITOR DOCK)",
-                "Windows USB peripherals & 2 physical monitors docked to Debian Laptop",
+                "Windows USB peripherals and 2 physical monitors docked to Debian Laptop",
             ),
         }
     }
@@ -190,6 +190,16 @@ impl TelemetrySnapshot {
 }
 
 pub fn request_mode(target: OperationalMode) -> Result<String, String> {
+    if !TelemetrySnapshot::read_current().daemon_online {
+        let _ = start_local_daemon();
+        for _ in 0..12 {
+            thread::sleep(Duration::from_millis(50));
+            if TelemetrySnapshot::read_current().daemon_online {
+                break;
+            }
+        }
+    }
+
     match ShmWatchdog::open(false) {
         Ok(shm) => {
             let block = shm.block();
@@ -461,6 +471,9 @@ fn main() {
         println!("duplex-kvm all-in-one self-test passed: {json}");
         return;
     }
+
+    // Automatically start the local daemon + 250ms watchdog when the user opens the GUI
+    let _ = start_local_daemon();
 
     if web_only {
         web::run_web_server_blocking(port, !no_browser);

@@ -162,11 +162,16 @@ pub struct CryptoSession {
 impl CryptoSession {
     pub fn new(shared_key: &[u8; 32], tx_channel: ChannelId, rx_channel: ChannelId) -> Self {
         let key = Key::from_slice(shared_key);
+        let initial_seq = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(1)
+            .max(1);
         Self {
             cipher: ChaCha20Poly1305::new(key),
             tx_channel,
             rx_channel,
-            tx_seq: 1,
+            tx_seq: initial_seq,
             rx_replay: ReplayWindow::new(),
         }
     }
@@ -304,13 +309,13 @@ mod tests {
 
         let frame = alice.seal_frame(&msg).expect("seal must succeed");
         let (seq, decoded) = bob.open_frame(&frame).expect("open must succeed");
-        assert_eq!(seq, 1);
+        assert!(seq >= 1);
         assert_eq!(decoded, msg);
 
         // Replaying the exact same packet must be rejected
         assert!(matches!(
             bob.open_frame(&frame),
-            Err(CryptoFrameError::ReplayDetected(1))
+            Err(CryptoFrameError::ReplayDetected(s)) if s == seq
         ));
     }
 }
