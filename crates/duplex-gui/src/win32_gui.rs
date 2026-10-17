@@ -5,7 +5,8 @@
 //! local `duplexd.exe` launcher, browser dashboard launcher, and an emergency panic release button.
 
 use crate::{
-    open_url_in_browser, request_mode, start_local_daemon, trigger_panic_release, TelemetrySnapshot,
+    open_url_in_browser, request_mode, run_embedded_network_setup, start_local_daemon,
+    trigger_panic_release, TelemetrySnapshot,
 };
 use duplex_proto::OperationalMode;
 use windows::core::PCWSTR;
@@ -27,6 +28,7 @@ const ID_BTN_MODE_LAPTOP: usize = 1004;
 const ID_BTN_START_DAEMON: usize = 1005;
 const ID_BTN_OPEN_WEB: usize = 1006;
 const ID_BTN_PANIC: usize = 1007;
+const ID_BTN_SETUP_NETWORK: usize = 1008;
 const ID_TIMER_TELEMETRY: usize = 2001;
 
 use core::ffi::c_void;
@@ -213,11 +215,11 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "BUTTON",
-                "Start Local Daemon (duplexd.exe)",
+                "Start Local Daemon",
                 btn_style,
                 18,
                 390,
-                288,
+                190,
                 34,
                 ID_BTN_START_DAEMON,
             );
@@ -225,11 +227,23 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "BUTTON",
-                &format!("Open Browser UI (127.0.0.1:{port})"),
+                "1-Click Setup Network",
                 btn_style,
-                320,
+                218,
                 390,
-                288,
+                190,
+                34,
+                ID_BTN_SETUP_NETWORK,
+            );
+            let _ = create_child_control(
+                hwnd,
+                hinst,
+                "BUTTON",
+                &format!("Open Browser UI (:{port})"),
+                btn_style,
+                418,
+                390,
+                190,
                 34,
                 ID_BTN_OPEN_WEB,
             );
@@ -302,6 +316,10 @@ unsafe extern "system" fn wnd_proc(
                     let res = start_local_daemon();
                     set_status_text(&res.unwrap_or_else(|e| e));
                     update_telemetry_label();
+                }
+                ID_BTN_SETUP_NETWORK => {
+                    let res = run_embedded_network_setup();
+                    set_status_text(&res.unwrap_or_else(|e| e));
                 }
                 ID_BTN_OPEN_WEB => {
                     let port = WEB_PORT_WIN.load(Ordering::Relaxed);

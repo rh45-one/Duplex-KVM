@@ -113,8 +113,10 @@ dependencies = [
 name = "duplex-gui"
 version = "0.1.0"
 dependencies = [
+ "duplex-guard",
  "duplex-pal",
  "duplex-proto",
+ "duplexd",
  "libc",
  "windows",
 ]
@@ -144,6 +146,7 @@ dependencies = [
 name = "duplexd"
 version = "0.1.0"
 dependencies = [
+ "duplex-guard",
  "duplex-pal",
  "duplex-proto",
  "tracing",

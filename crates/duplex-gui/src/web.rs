@@ -4,7 +4,8 @@
 //! (or in the foreground when `--web` is passed or no display server is available).
 
 use crate::{
-    open_url_in_browser, request_mode, start_local_daemon, trigger_panic_release, TelemetrySnapshot,
+    open_url_in_browser, request_mode, run_embedded_network_setup, start_local_daemon,
+    trigger_panic_release, TelemetrySnapshot,
 };
 use duplex_proto::OperationalMode;
 use std::io::{Read, Write};
@@ -216,12 +217,18 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
   <div class="section">
-    <h2>Daemon Supervision &amp; Emergency Safety</h2>
-    <div class="actions-row">
+    <h2>Daemon Supervision, 1-Click Network Setup &amp; Emergency Safety</h2>
+    <div class="actions-row" style="margin-bottom: 12px;">
       <button class="btn-start" onclick="startDaemon()">
-        <span class="btn-title">Start Local Daemon (duplexd)</span>
-        <span class="btn-desc">Spawns duplexd + duplex-guard watchdog in the background if not running</span>
+        <span class="btn-title">Start Local Daemon</span>
+        <span class="btn-desc">Spawns background daemon + 250ms watchdog from this single executable</span>
       </button>
+      <button class="btn-start" onclick="setupNetwork()">
+        <span class="btn-title">1-Click Setup 1GbE Network</span>
+        <span class="btn-desc">Configures 192.168.137.x static subnet, NAT passthrough &amp; udev/Firewall</span>
+      </button>
+    </div>
+    <div class="actions-row">
       <button class="btn-panic" onclick="triggerPanic()">
         <span class="btn-title">EMERGENCY PANIC / UNGRAB ALL (Ctrl+Alt+Shift+Bksp)</span>
         <span class="btn-desc">Immediately releases input grabs, unsticks modifiers &amp; forces Mode 0 Idle</span>
@@ -243,6 +250,7 @@ async function postAction(url) {
 function setMode(target) { postAction('/api/mode?target=' + encodeURIComponent(target)); }
 function triggerPanic() { postAction('/api/panic'); }
 function startDaemon() { postAction('/api/start-daemon'); }
+function setupNetwork() { postAction('/api/setup-network'); }
 
 async function refreshStatus() {
   try {
@@ -363,6 +371,15 @@ fn handle_http_client(mut stream: TcpStream) {
 
     if method == "POST" && path.starts_with("/api/start-daemon") {
         let msg = match start_local_daemon() {
+            Ok(m) => m,
+            Err(e) => e,
+        };
+        write_json_message(&mut stream, &msg);
+        return;
+    }
+
+    if method == "POST" && path.starts_with("/api/setup-network") {
+        let msg = match run_embedded_network_setup() {
             Ok(m) => m,
             Err(e) => e,
         };

@@ -6,12 +6,14 @@ license.workspace = true
 authors.workspace = true
 
 [[bin]]
-name = "duplex-gui"
+name = "duplex-kvm"
 path = "src/main.rs"
 
 [dependencies]
 duplex-proto = { workspace = true }
 duplex-pal = { workspace = true }
+duplex-guard = { path = "../duplex-guard" }
+duplexd = { path = "../duplexd" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = { workspace = true }

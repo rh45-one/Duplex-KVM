@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "duplexd"
+path = "src/lib.rs"
+
 [[bin]]
 name = "duplexd"
 path = "src/main.rs"
@@ -11,5 +15,6 @@ path = "src/main.rs"
 [dependencies]
 duplex-proto.workspace = true
 duplex-pal.workspace = true
+duplex-guard = { path = "../duplex-guard" }
 tracing.workspace = true
 tracing-subscriber.workspace = true

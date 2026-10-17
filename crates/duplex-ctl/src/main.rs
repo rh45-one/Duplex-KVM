@@ -138,9 +138,9 @@ fn main() {
         }
         "gui" => {
             let gui_bin = if cfg!(target_os = "windows") {
-                "duplex-gui.exe"
+                "duplex-kvm.exe"
             } else {
-                "duplex-gui"
+                "duplex-kvm"
             };
             let exe_path = env::current_exe()
                 .ok()

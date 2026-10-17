@@ -2,97 +2,56 @@
 
 **Cross-Platform Bidirectional Wired KVM, Virtual Display Streamer & 1 Gbps Network Passthrough (Debian Linux <-> Windows 11)**
 
-`duplex-kvm` is a symmetric peer-to-peer daemon (`duplexd`), hardware watchdog (`duplex-guard`), CLI controller (`duplex-ctl`), and graphical control center (`duplex-gui`) connecting a **Debian Linux Laptop (`192.168.137.2`)** and a **Windows 11 Desktop PC (`192.168.137.1`)** over a direct 1 Gbps Cat6 Ethernet cable.
+---
+
+## Single-File Quick Start (Zero Installation Needed)
+
+Everything (Graphical Control Center, `duplexd` Daemon, `duplex-guard` 250ms Dead-Man's Switch Watchdog, CLI Controller, and 1-Click Network Setup Scripts) is compiled into **one standalone file per OS**:
+
+| Operating System | Single-File Executable | How to Run |
+| :--- | :--- | :--- |
+| **Windows 11 Desktop (`192.168.137.1`)** | **[`releases/duplex-kvm-windows-x86_64.exe`](releases/duplex-kvm-windows-x86_64.exe)** *(2.4 MB)* | Download the `.exe` and **double-click it** to open the Graphical Control Center. |
+| **Debian Linux Laptop (`192.168.137.2`)** | **[`releases/duplex-kvm-linux-x86_64`](releases/duplex-kvm-linux-x86_64)** *(1.7 MB)* | Run `./duplex-kvm-linux-x86_64` to open the Graphical Control Center. |
+
+### Inside the Graphical Control Center:
+1. **1-Click Setup Network:** Click **"1-Click Setup Network"** on first run to automatically configure the `192.168.137.1/24` <-> `192.168.137.2/24` 1GbE subnet, Windows NAT internet passthrough, firewall rules, and Linux `udev` / Wi-Fi-safe (`route-metric 700`) NetworkManager settings.
+2. **Start Local Daemon:** Click **"Start Local Daemon"** to launch the built-in background daemon and 250ms Dead-Man's Switch watchdog directly from the same executable.
+3. **Switch Operational Modes with 1 Click:**
+   - **Mode 0 — Idle (Local Only + 1GbE Internet Passthrough)**
+   - **Mode 1 — PC Primary (Laptop Controls Windows PC, KVM Input Only)**
+   - **Mode 1+ — PC Primary (Laptop Controls PC + Extend 1 Virtual Display)**
+   - **Mode 2 — Laptop Primary (Dock Windows Dual Monitors & Peripherals to Laptop)**
+4. **Emergency Panic Release:** Click **"EMERGENCY PANIC / UNGRAB ALL"** or press **`Ctrl + Alt + Shift + Backspace`** (or **`Escape` 5 times in 1.5s**) on your physical keyboard to immediately release all input grabs and virtual displays.
 
 ---
 
-## Workspace Crates
+## Optional Command-Line Flags (Using the Same Single File)
+
+Both `duplex-kvm-linux-x86_64` and `duplex-kvm-windows-x86_64.exe` also accept CLI arguments if you prefer terminal control:
+
+```bash
+./duplex-kvm-linux-x86_64                  # Launch Native Desktop GUI + Web UI (127.0.0.1:48180)
+./duplex-kvm-linux-x86_64 --web            # Open Web Control Center in default browser
+./duplex-kvm-linux-x86_64 --setup          # Run embedded 1GbE network & udev setup script
+./duplex-kvm-linux-x86_64 --daemon         # Run the background KVM/Video daemon directly
+./duplex-kvm-linux-x86_64 status           # Print live link RTT, heartbeat & packet telemetry
+./duplex-kvm-linux-x86_64 watch            # Live 10 Hz terminal dashboard
+./duplex-kvm-linux-x86_64 mode pc          # Switch to Mode 1+ (PC Primary + Extended Display)
+./duplex-kvm-linux-x86_64 mode pc --no-display # Switch to Mode 1 (PC Primary, KVM Input Only)
+./duplex-kvm-linux-x86_64 mode laptop      # Switch to Mode 2 (Dock PC Dual Monitors to Laptop)
+./duplex-kvm-linux-x86_64 mode idle        # Switch to Mode 0 (Idle / Local Only)
+./duplex-kvm-linux-x86_64 panic            # Trigger immediate emergency ungrab
+```
+
+---
+
+## Architecture & Workspace Crates
 
 | Crate | Description |
 | :--- | :--- |
 | `crates/duplex-proto` | Zero-allocation wire framing, canonical USB HID Usage ID (`0x07`) keymap translation, `ChaCha20-Poly1305` encryption + 64-bit anti-replay window, VESA EDID 1.4 generator, video chunking/PLI, and shared-memory telemetry block (`ShmWatchdogBlock`). |
 | `crates/duplex-pal` | Platform Abstraction Layer (`InputBackend`, `VirtualDisplayBackend`, `VideoPipelineBackend`, and strict DSCP QoS sockets). |
-| `crates/duplex-guard` | Independent 250ms Dead-Man's Switch watchdog process monitoring local daemon and remote 50 Hz peer heartbeats via POSIX `/dev/shm` and Win32 `CreateFileMappingW`. |
+| `crates/duplex-guard` | Independent 250ms Dead-Man's Switch watchdog module monitoring local daemon and remote 50 Hz peer heartbeats via POSIX `/dev/shm` and Win32 `CreateFileMappingW`. |
 | `crates/duplexd` | Symmetric peer-to-peer daemon coordinating input capture/injection, virtual display attachment, low-latency HEVC streaming (`60 Mbps` cap per monitor), and decoupled 1000 Hz hardware cursor updates. |
-| `crates/duplex-ctl` | Command-line switcher (`status`, `watch`, `mode`, `panic`, `gui`). |
-| `crates/duplex-gui` | Native GTK+ 3 (Linux Wayland/X11) and Win32 (Windows 11) desktop graphical control center + embedded localhost Web UI (`http://127.0.0.1:48180`). |
-
----
-
-## Operational Modes
-
-1. **`MODE_0_IDLE` (Local Only + 1GbE Internet Passthrough)**
-   - Both machines use their own physical displays and peripherals independently.
-   - All virtual displays are detached and all input grabs/hooks are released.
-2. **`MODE_1_PC_PRIMARY` (Debian Laptop Controls Windows PC + Optional Extended Display)**
-   - **Input (`Linux -> Windows`):** Laptop grabs built-in keyboard/trackpad via `evdev` (`EVIOCGRAB`) and streams encrypted USB HID batches (`UDP 48100`, DSCP `EF 0xB8`) to Windows `SendInput`.
-   - **Display (`Windows -> Linux`, optional `--extend`):** Windows spawns 1 virtual display matching the Laptop screen, captures via DXGI Desktop Duplication, hardware-encodes HEVC via NVENC/AMF (`UDP 48102`, DSCP `AF41 0x88`), and streams to a borderless fullscreen `VA-API` viewer on Debian.
-3. **`MODE_2_LAPTOP_PRIMARY` (Windows Desktop Dual Monitors & Peripherals Docked to Debian Laptop)**
-   - **Input (`Windows -> Linux`):** Windows hooks & suppresses physical USB keyboard/mouse (`SetWindowsHookExW` + `WM_INPUT`) and streams encrypted USB HID packets to Linux `/dev/uinput`.
-   - **Display (`Linux -> Windows`):** Debian creates 2 virtual outputs matching the Windows Desktop's 2 physical monitors, captures via PipeWire/`VA-API` (`vaapih265enc`), and streams two low-latency HEVC streams (`UDP 48102-48103`) to two borderless fullscreen `D3D11VA` viewer windows on Windows.
-
----
-
-## Safety & Anti-Lockout Guardrails
-
-- **Hardware Panic Escape Hatch:** Press **`Ctrl + Alt + Shift + Backspace`** OR press **`Escape` 5 times within 1.5 seconds** on either machine to immediately release all input grabs/hooks, emit synthetic `KEY_UP` events for all modifiers, destroy fullscreen viewer windows, detach virtual displays, and transition to `MODE_0_IDLE`.
-- **250ms Dead-Man's Switch (`duplex-guard`):** Automatically reclaims input/display state within 250ms if `duplexd` hangs or the Ethernet cable is unplugged.
-
----
-
-## 1. One-Time Network & Link Setup
-
-### On Windows 11 Desktop (Run PowerShell as Administrator)
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\windows-setup-passthrough.ps1
-```
-*(Configures static IP `192.168.137.1/24` on the USB 1GbE adapter, sets up NAT internet passthrough from your WAN NIC, disables USB selective suspend / EEE, and scopes Firewall rules for ports `48100-48103` strictly to `192.168.137.1`.)*
-
-### On Debian Linux Laptop
-```bash
-sudo ./scripts/debian-setup-link.sh
-```
-*(Configures `/dev/uinput` and `/dev/input` udev permissions and creates the `duplex-kvm-1gbe` NetworkManager profile with static IP `192.168.137.2/24` and `route-metric 700` so Wi-Fi remains prioritized for internet while unplugged.)*
-
----
-
-## 2. Build & Run
-
-### Build Release Binaries
-```bash
-# Native Linux release build:
-cargo build --release
-
-# Or cross-compile Windows 11 .exe binaries from Debian:
-cargo build --release --target x86_64-pc-windows-gnu
-```
-
-### Start the Daemon (`duplexd`)
-- **Windows 11 Desktop:**
-  ```powershell
-  .\target\release\duplexd.exe --role pc
-  ```
-- **Debian Linux Laptop:**
-  ```bash
-  sudo ./target/release/duplexd --role laptop
-  ```
-
-### Launch the Graphical Interface (`duplex-gui`)
-```bash
-# Native Desktop GUI (GTK3 on Linux, Win32 on Windows) + background Web UI on 127.0.0.1:48180
-./target/release/duplex-gui
-
-# Or launch the Web UI in your browser:
-./target/release/duplex-gui --web
-```
-
-### Or Switch Modes via CLI (`duplex-ctl`)
-```bash
-./target/release/duplex-ctl status
-./target/release/duplex-ctl watch
-./target/release/duplex-ctl mode pc --no-display   # Mode 1 (KVM input only)
-./target/release/duplex-ctl mode pc --extend       # Mode 1+ (KVM + Extended Display)
-./target/release/duplex-ctl mode laptop            # Mode 2 (Dock PC Dual Monitors & Input to Laptop)
-./target/release/duplex-ctl mode idle              # Mode 0 (Idle / Local Only)
-./target/release/duplex-ctl panic                  # Emergency Panic Release
-```
+| `crates/duplex-gui` | Unified single-file executable (`duplex-kvm`) combining the native GTK+ 3 (Linux) and Win32 (Windows 11) GUI, embedded localhost Web UI (`127.0.0.1:48180`), daemon, watchdog, CLI, and embedded OS setup scripts. |
+| `crates/duplex-ctl` | Standalone lightweight CLI controller (`status`, `watch`, `mode`, `panic`, `gui`). |

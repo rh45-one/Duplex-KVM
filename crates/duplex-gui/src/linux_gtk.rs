@@ -5,7 +5,8 @@
 //! Wayland (GNOME/KDE) and X11 sessions.
 
 use crate::{
-    open_url_in_browser, request_mode, start_local_daemon, trigger_panic_release, TelemetrySnapshot,
+    open_url_in_browser, request_mode, run_embedded_network_setup, start_local_daemon,
+    trigger_panic_release, TelemetrySnapshot,
 };
 use core::ffi::{c_char, c_int, c_uint, c_ulong, c_void};
 use core::ptr;
@@ -173,6 +174,11 @@ unsafe extern "C" fn on_mode_laptop(_widget: *mut c_void, _data: *mut c_void) {
 
 unsafe extern "C" fn on_start_daemon(_widget: *mut c_void, _data: *mut c_void) {
     let res = start_local_daemon();
+    set_status_banner(&res.unwrap_or_else(|e| e));
+}
+
+unsafe extern "C" fn on_setup_network(_widget: *mut c_void, _data: *mut c_void) {
+    let res = run_embedded_network_setup();
     set_status_banner(&res.unwrap_or_else(|e| e));
 }
 
@@ -354,15 +360,21 @@ pub fn run_native_gtk_window(web_port: u16) -> bool {
 
         gtk_box_pack_start(root_vbox, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, 0, 4);
 
-        // Daemon & Web UI Row
+        // Daemon, 1-Click Network Setup & Web UI Row
         let action_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
         let btn_start = gtk_button_new_with_label(
-            CString::new("Start Local Daemon (duplexd)").unwrap().as_ptr(),
+            CString::new("Start Local Daemon").unwrap().as_ptr(),
         );
         let start_name = CString::new("btn-start").unwrap();
         gtk_widget_set_name(btn_start, start_name.as_ptr());
         connect_clicked(btn_start, on_start_daemon);
         gtk_box_pack_start(action_hbox, btn_start, 1, 1, 0);
+
+        let btn_setup = gtk_button_new_with_label(
+            CString::new("1-Click Setup Network").unwrap().as_ptr(),
+        );
+        connect_clicked(btn_setup, on_setup_network);
+        gtk_box_pack_start(action_hbox, btn_setup, 1, 1, 0);
 
         let btn_web = gtk_button_new_with_label(
             CString::new(format!("Open Browser UI (127.0.0.1:{web_port})"))

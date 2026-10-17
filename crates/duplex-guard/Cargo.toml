@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "duplex_guard"
+path = "src/lib.rs"
+
 [[bin]]
 name = "duplex-guard"
 path = "src/main.rs"
