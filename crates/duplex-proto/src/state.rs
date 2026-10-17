@@ -63,8 +63,13 @@ impl OperationalMode {
     pub const fn as_u8(self) -> u8 {
         match self {
             Self::Mode0Idle => 0,
-            Self::Mode1PcPrimary { .. } => 1,
+            Self::Mode1PcPrimary {
+                extend_display: true,
+            } => 1,
             Self::Mode2LaptopPrimary => 2,
+            Self::Mode1PcPrimary {
+                extend_display: false,
+            } => 3,
         }
     }
 
@@ -75,6 +80,9 @@ impl OperationalMode {
                 extend_display: true,
             },
             2 => Self::Mode2LaptopPrimary,
+            3 => Self::Mode1PcPrimary {
+                extend_display: false,
+            },
             _ => Self::Mode0Idle,
         }
     }

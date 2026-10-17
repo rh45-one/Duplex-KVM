@@ -41,13 +41,28 @@ pub struct ShmWatchdogBlock {
     pub force_reset_requested: AtomicBool,
     /// Operator mode-switch request written by `duplex-ctl mode <idle|pc|laptop>` (`0xFF` = none).
     pub requested_mode: AtomicU8,
-    pub _pad0: [u8; 2],
+    pub peer_connected: AtomicBool,
+    pub _pad0: [u8; 1],
     /// Monotonic timestamp (ns) of the last `duplexd` local main-loop tick.
     pub daemon_heartbeat_ns: AtomicU64,
     /// Monotonic timestamp (ns) of the last authenticated 50 Hz network heartbeat received from peer.
     pub peer_heartbeat_ns: AtomicU64,
-    /// Latest measured peer round-trip latency in nanoseconds (for `duplex-ctl status`).
+    /// Latest measured peer round-trip latency in nanoseconds.
     pub last_rtt_ns: AtomicU64,
+    /// Minimum observed peer round-trip latency in nanoseconds.
+    pub min_rtt_ns: AtomicU64,
+    /// Maximum observed peer round-trip latency in nanoseconds.
+    pub max_rtt_ns: AtomicU64,
+    /// Total HID event batches transmitted over UDP 48100 (DSCP EF).
+    pub tx_hid_packets: AtomicU64,
+    /// Total HID event batches received over UDP 48100 (DSCP EF).
+    pub rx_hid_packets: AtomicU64,
+    /// Total hardware-encoded HEVC video access units transmitted over UDP 48102-48103 (DSCP AF41).
+    pub tx_video_frames: AtomicU64,
+    /// Total hardware-encoded HEVC video access units reassembled and submitted to viewer decoder.
+    pub rx_video_frames: AtomicU64,
+    /// Total PLI keyframe recovery requests triggered.
+    pub pli_keyframes_requested: AtomicU64,
     /// Mirrored 256-bit depressed USB HID key bitmap (`0x00..=0xFF`).
     /// Allows `duplex-guard` to emit synthetic `KEY_UP` for every held key even if `duplexd` hard-locks.
     pub depressed_keys_bitmap: [AtomicU64; 4],
@@ -66,13 +81,35 @@ impl ShmWatchdogBlock {
         self.force_reset_requested.store(false, Ordering::Release);
         self.requested_mode
             .store(NO_REQUESTED_MODE, Ordering::Release);
+        self.peer_connected.store(false, Ordering::Release);
         self.daemon_heartbeat_ns.store(now_ns, Ordering::Release);
         self.peer_heartbeat_ns.store(now_ns, Ordering::Release);
         self.last_rtt_ns.store(0, Ordering::Release);
+        self.min_rtt_ns.store(u64::MAX, Ordering::Release);
+        self.max_rtt_ns.store(0, Ordering::Release);
+        self.tx_hid_packets.store(0, Ordering::Release);
+        self.rx_hid_packets.store(0, Ordering::Release);
+        self.tx_video_frames.store(0, Ordering::Release);
+        self.rx_video_frames.store(0, Ordering::Release);
+        self.pli_keyframes_requested.store(0, Ordering::Release);
         for word in &self.depressed_keys_bitmap {
             word.store(0, Ordering::Release);
         }
         self.magic.store(SHM_WATCHDOG_MAGIC, Ordering::SeqCst);
+    }
+
+    /// Records a newly measured peer round-trip time sample (`rtt_ns`), updating `last`, `min`, and `max`.
+    #[inline]
+    pub fn record_rtt_sample(&self, rtt_ns: u64) {
+        self.last_rtt_ns.store(rtt_ns, Ordering::Release);
+        let cur_min = self.min_rtt_ns.load(Ordering::Relaxed);
+        if rtt_ns < cur_min {
+            self.min_rtt_ns.store(rtt_ns, Ordering::Release);
+        }
+        let cur_max = self.max_rtt_ns.load(Ordering::Relaxed);
+        if rtt_ns > cur_max {
+            self.max_rtt_ns.store(rtt_ns, Ordering::Release);
+        }
     }
 
     #[inline]

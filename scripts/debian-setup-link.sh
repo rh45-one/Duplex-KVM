@@ -53,8 +53,12 @@ if [[ -n "${SUDO_USER:-}" ]]; then
     echo "      Added user '$SUDO_USER' to 'input' group."
 fi
 
-# 2. Configure Static IPv4 192.168.137.2/24 + Gateway 192.168.137.1 via NetworkManager (or iproute2 fallback)
-echo "[2/4] Configuring static 1GbE link ($DUPLEX_LOCAL_IP/24 -> Gateway $DUPLEX_GATEWAY_IP) on '$IFACE'..."
+# 2. Configure Static IPv4 192.168.137.2/24 + Fallback Gateway 192.168.137.1 via NetworkManager
+#    NOTE: We use route-metric 700 (higher than Wi-Fi's default 600) and dns-priority 50 so that:
+#    - 192.168.137.0/24 KVM traffic ALWAYS routes over the 1GbE cable (longest prefix /24 match),
+#    - Active Wi-Fi (metric 600) is NEVER hijacked when connected,
+#    - If Wi-Fi is turned off/disconnected, internet automatically fails over to 192.168.137.1 (metric 700).
+echo "[2/4] Configuring static 1GbE link ($DUPLEX_LOCAL_IP/24 -> Gateway $DUPLEX_GATEWAY_IP, metric 700) on '$IFACE'..."
 if command -v nmcli >/dev/null 2>&1; then
     nmcli connection delete "$CONN_NAME" >/dev/null 2>&1 || true
     nmcli connection add \
@@ -65,16 +69,15 @@ if command -v nmcli >/dev/null 2>&1; then
         ipv4.addresses "${DUPLEX_LOCAL_IP}/24" \
         ipv4.gateway "$DUPLEX_GATEWAY_IP" \
         ipv4.dns "$DUPLEX_DNS" \
-        ipv4.route-metric 50 \
+        ipv4.dns-priority 50 \
+        ipv4.route-metric 700 \
         ipv6.method ignore \
         connection.autoconnect yes \
         connection.autoconnect-priority 100
-    nmcli connection up "$CONN_NAME" || true
 else
     ip link set dev "$IFACE" up
-    ip addr flush dev "$IFACE"
-    ip addr add "${DUPLEX_LOCAL_IP}/24" dev "$IFACE"
-    ip route replace default via "$DUPLEX_GATEWAY_IP" dev "$IFACE" metric 50
+    ip addr replace "${DUPLEX_LOCAL_IP}/24" dev "$IFACE"
+    ip route replace default via "$DUPLEX_GATEWAY_IP" dev "$IFACE" metric 700
 fi
 
 # 3. Disable Energy Efficient Ethernet (EEE) to prevent PHY wake latency spikes

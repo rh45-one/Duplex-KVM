@@ -1,10 +1,10 @@
 //! `duplexd` — Symmetric Peer-to-Peer KVM, Virtual Display & Network Multiplexer Daemon.
 //!
-//! Phase 4 integrates:
-//! - Low-Latency Hardware Video Pipeline (`DXGI+NVENC/D3D11VA` on Windows <-> `PipeWire+VA-API` on Debian)
-//! - Dual-stream UDP `48102-48103` (`DSCP AF41` `0x88`) 60 Mbps CBR HEVC packetizer & reassembler
-//! - Automatic PLI (`VideoKeyframeRequest`) IDR recovery on UDP fragment gap
-//! - 1000 Hz Decoupled Hardware Cursor telemetry (`WirePayload::CursorUpdate`)
+//! Phase 5 completes the full system integration:
+//! - Deterministic 3-mode state machine (`MODE_0_IDLE`, `MODE_1_PC_PRIMARY { extend_display }`, `MODE_2_LAPTOP_PRIMARY`)
+//! - Automatic co-process supervision of `duplex-guard` (250ms Dead-Man's Switch)
+//! - Live shared-memory telemetry counters (`tx/rx_hid_packets`, `tx/rx_video_frames`, `pli_keyframes_requested`, `min/last/max_rtt_ns`)
+//! - Built-in deterministic `--self-test` verification suite
 
 mod net;
 
@@ -17,16 +17,27 @@ use duplex_pal::{
 use duplex_proto::{
     CursorTelemetry, DisplayDescriptor, EncodedVideoFrame, HidEvent, ModeStateMachine, NodeRole,
     OperationalMode, TransitionReason, WirePayload, MAX_VIDEO_BITRATE_KBPS, NO_REQUESTED_MODE,
+    WATCHDOG_TIMEOUT_NS,
 };
 use net::{default_link_ips, resolve_psk_from_env, DuplexTransport};
 use std::env;
 use std::net::Ipv4Addr;
+use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
 const DISPLAY_ADVERTISE_INTERVAL_NS: u64 = 2_000_000_000; // 2 seconds
+
+struct CliConfig {
+    role: NodeRole,
+    local_ip: Ipv4Addr,
+    peer_ip: Ipv4Addr,
+    check_only: bool,
+    self_test: bool,
+    spawn_guard: bool,
+}
 
 fn detect_default_role() -> NodeRole {
     #[cfg(target_os = "linux")]
@@ -39,17 +50,21 @@ fn detect_default_role() -> NodeRole {
     }
 }
 
-fn parse_cli_args() -> (NodeRole, Ipv4Addr, Ipv4Addr, bool) {
+fn parse_cli_args() -> CliConfig {
     let mut role = detect_default_role();
     let mut custom_local_ip: Option<Ipv4Addr> = None;
     let mut custom_peer_ip: Option<Ipv4Addr> = None;
     let mut check_only = false;
+    let mut self_test = false;
+    let mut spawn_guard = true;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--check-init" => check_only = true,
+            "--self-test" => self_test = true,
+            "--no-spawn-guard" => spawn_guard = false,
             "--role" if i + 1 < args.len() => {
                 role = match args[i + 1].as_str() {
                     "laptop" | "debian" => NodeRole::DebianLaptop,
@@ -80,12 +95,48 @@ fn parse_cli_args() -> (NodeRole, Ipv4Addr, Ipv4Addr, bool) {
     }
 
     let (default_local, default_peer) = default_link_ips(role);
-    (
+    CliConfig {
         role,
-        custom_local_ip.unwrap_or(default_local),
-        custom_peer_ip.unwrap_or(default_peer),
+        local_ip: custom_local_ip.unwrap_or(default_local),
+        peer_ip: custom_peer_ip.unwrap_or(default_peer),
         check_only,
-    )
+        self_test,
+        spawn_guard,
+    }
+}
+
+/// Automatically locates and spawns the companion `duplex-guard` 250ms Dead-Man's Switch binary.
+fn try_spawn_watchdog_coprocess() -> Option<Child> {
+    let exe_path = env::current_exe().ok()?;
+    let parent_dir = exe_path.parent()?;
+    #[cfg(target_os = "windows")]
+    let guard_bin = parent_dir.join("duplex-guard.exe");
+    #[cfg(not(target_os = "windows"))]
+    let guard_bin = parent_dir.join("duplex-guard");
+
+    if !guard_bin.exists() {
+        return None;
+    }
+
+    match Command::new(&guard_bin)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(child) => {
+            info!(
+                guard_pid = child.id(),
+                path = %guard_bin.display(),
+                "Spawned companion duplex-guard 250ms Dead-Man's Switch watchdog process"
+            );
+            Some(child)
+        }
+        Err(e) => {
+            warn!("Could not auto-spawn duplex-guard companion binary: {e}");
+            None
+        }
+    }
 }
 
 fn build_target_display_specs(
@@ -225,6 +276,56 @@ fn apply_mode_transition(
     );
 }
 
+fn run_phase5_self_test(shm: &Arc<ShmWatchdog>) {
+    info!("Running Phase 5 deterministic state machine & SHM self-test...");
+    let mut sm = ModeStateMachine::new();
+    assert_eq!(sm.current_mode(), OperationalMode::Mode0Idle);
+
+    // 1. Mode 1 (PC Primary with Extended Virtual Display)
+    let m1_ext = OperationalMode::Mode1PcPrimary {
+        extend_display: true,
+    };
+    assert_eq!(
+        sm.transition(m1_ext, TransitionReason::OperatorCommand)
+            .unwrap(),
+        m1_ext
+    );
+    assert_eq!(OperationalMode::from_u8_lossy(m1_ext.as_u8()), m1_ext);
+
+    // 2. Mode 1 (PC Primary Input-Only KVM)
+    let m1_no_disp = OperationalMode::Mode1PcPrimary {
+        extend_display: false,
+    };
+    assert_eq!(
+        sm.transition(m1_no_disp, TransitionReason::OperatorCommand)
+            .unwrap(),
+        m1_no_disp
+    );
+    assert_eq!(
+        OperationalMode::from_u8_lossy(m1_no_disp.as_u8()),
+        m1_no_disp
+    );
+
+    // 3. Mode 2 (Laptop Primary + Dual Monitors Docked)
+    let m2 = OperationalMode::Mode2LaptopPrimary;
+    assert_eq!(
+        sm.transition(m2, TransitionReason::PeerRequest).unwrap(),
+        m2
+    );
+    assert_eq!(OperationalMode::from_u8_lossy(m2.as_u8()), m2);
+
+    // 4. Hardware Panic Escape Hatch overrides any target to Mode0Idle
+    assert_eq!(
+        sm.transition(m2, TransitionReason::HardwarePanicEscape)
+            .unwrap(),
+        OperationalMode::Mode0Idle
+    );
+
+    shm.block().record_rtt_sample(185_000); // 185 µs
+    assert_eq!(shm.block().last_rtt_ns.load(Ordering::Acquire), 185_000);
+    info!("Phase 5 self-test passed all assertions!");
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -233,17 +334,22 @@ fn main() {
         )
         .init();
 
-    let (role, local_ip, peer_ip, check_only) = parse_cli_args();
+    let cfg = parse_cli_args();
     info!(
-        ?role,
-        %local_ip,
-        %peer_ip,
-        "Initializing duplexd symmetric KVM & Hardware Video daemon (Phase 4)"
+        role = ?cfg.role,
+        local_ip = %cfg.local_ip,
+        peer_ip = %cfg.peer_ip,
+        "Initializing duplexd symmetric KVM, Virtual Display & Video daemon (Phase 5)"
     );
 
     let shm = Arc::new(
         ShmWatchdog::open(true).expect("Failed to initialize shared memory watchdog block"),
     );
+
+    if cfg.self_test {
+        run_phase5_self_test(&shm);
+        return;
+    }
 
     let mut display_pal =
         create_virtual_display_backend().expect("Failed to create VirtualDisplayBackend");
@@ -267,18 +373,26 @@ fn main() {
     let _ = input_pal.release_all_stuck_keys();
 
     let psk = resolve_psk_from_env();
-    let mut transport = match DuplexTransport::bind_strict(role, local_ip, peer_ip, &psk) {
-        Ok(t) => Some(t),
-        Err(e) => {
-            if check_only {
-                warn!("Interface {local_ip} not yet up during --check-init: {e}");
-                return;
+    let mut transport =
+        match DuplexTransport::bind_strict(cfg.role, cfg.local_ip, cfg.peer_ip, &psk) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                if cfg.check_only {
+                    warn!("Interface {} not yet up during --check-init: {e}", cfg.local_ip);
+                    return;
+                }
+                error!(
+                    "Failed to bind strict QoS sockets on {} (ensure link is connected): {e}",
+                    cfg.local_ip
+                );
+                std::process::exit(1);
             }
-            error!(
-                "Failed to bind strict QoS sockets on {local_ip} (run setup script first): {e}"
-            );
-            std::process::exit(1);
-        }
+        };
+
+    let _guard_child = if cfg.spawn_guard && !cfg.check_only {
+        try_spawn_watchdog_coprocess()
+    } else {
+        None
     };
 
     let mut state_machine = ModeStateMachine::new();
@@ -287,10 +401,10 @@ fn main() {
 
     info!(
         mode = ?state_machine.current_mode(),
-        "duplexd active in MODE_0_IDLE with Hardware Video Pipeline & Decoupled Cursor ready"
+        "duplexd active in MODE_0_IDLE (Phase 5 Full State Machine Ready)"
     );
 
-    if check_only {
+    if cfg.check_only {
         return;
     }
 
@@ -306,12 +420,18 @@ fn main() {
         let block = shm.block();
         block.beat_daemon(now_ns);
 
+        // Update peer_connected status based on 250ms peer heartbeat window
+        let peer_age = now_ns.saturating_sub(block.peer_heartbeat_ns.load(Ordering::Acquire));
+        block
+            .peer_connected
+            .store(peer_age <= WATCHDOG_TIMEOUT_NS, Ordering::Release);
+
         // Periodically advertise our physical monitor EDIDs/specs so the peer can spawn matching virtual displays
         if now_ns.saturating_sub(last_display_adv_ns) >= DISPLAY_ADVERTISE_INTERVAL_NS {
             last_display_adv_ns = now_ns;
             if let Some(ref mut net_io) = transport {
                 let adv = WirePayload::AdvertiseDisplays {
-                    role,
+                    role: cfg.role,
                     displays: local_physical_displays.clone(),
                 };
                 let _ = net_io.send_control_payload(&adv);
@@ -322,7 +442,7 @@ fn main() {
         if block.force_reset_requested.swap(false, Ordering::AcqRel) {
             warn!("Received emergency reset signal from duplex-guard; reverting to MODE_0_IDLE");
             apply_mode_transition(
-                role,
+                cfg.role,
                 &mut state_machine,
                 OperationalMode::Mode0Idle,
                 TransitionReason::WatchdogTimeout,
@@ -342,7 +462,7 @@ fn main() {
         if req != NO_REQUESTED_MODE {
             let target_mode = OperationalMode::from_u8_lossy(req);
             apply_mode_transition(
-                role,
+                cfg.role,
                 &mut state_machine,
                 target_mode,
                 TransitionReason::OperatorCommand,
@@ -379,7 +499,9 @@ fn main() {
 
         if !outgoing_hid_buf.is_empty() {
             if let Some(ref mut net_tx) = transport {
-                let _ = net_tx.send_hid_events(&outgoing_hid_buf, now_ns);
+                if net_tx.send_hid_events(&outgoing_hid_buf, now_ns).is_ok() {
+                    block.tx_hid_packets.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
 
@@ -392,7 +514,7 @@ fn main() {
                 net_tx.send_emergency_modifier_flush(now_ns);
             }
             apply_mode_transition(
-                role,
+                cfg.role,
                 &mut state_machine,
                 OperationalMode::Mode0Idle,
                 TransitionReason::HardwarePanicEscape,
@@ -408,7 +530,7 @@ fn main() {
         }
 
         // 4. Poll hardware-encoded HEVC video frames & decoupled 1000 Hz cursor telemetry
-        if state_machine.current_mode().should_stream_video(role) {
+        if state_machine.current_mode().should_stream_video(cfg.role) {
             encoded_video_buf.clear();
             let mut cursor_telemetry_opt: Option<CursorTelemetry> = None;
             if let Ok(frame_count) =
@@ -422,6 +544,9 @@ fn main() {
                         for frame in &encoded_video_buf {
                             net_tx.send_video_frame(frame);
                         }
+                        block
+                            .tx_video_frames
+                            .fetch_add(frame_count as u64, Ordering::Relaxed);
                     }
                 }
             }
@@ -442,6 +567,7 @@ fn main() {
             net_io.poll_incoming_video(&mut incoming_video_buf, &mut pli_monitors_buf);
 
             for mon_idx in pli_monitors_buf.drain(..) {
+                block.pli_keyframes_requested.fetch_add(1, Ordering::Relaxed);
                 let _ = net_io.send_control_payload(&WirePayload::VideoKeyframeRequest {
                     monitor_index: mon_idx,
                 });
@@ -450,6 +576,7 @@ fn main() {
 
         for frame in incoming_video_buf.drain(..) {
             block.beat_peer(now_ns);
+            block.rx_video_frames.fetch_add(1, Ordering::Relaxed);
             let _ = video_pal.submit_encoded_frame(&frame);
         }
 
@@ -457,9 +584,10 @@ fn main() {
             match payload {
                 WirePayload::HidBatch { events, .. } => {
                     block.beat_peer(now_ns);
+                    block.rx_hid_packets.fetch_add(1, Ordering::Relaxed);
                     let cur_mode = state_machine.current_mode();
                     let inject_allowed = cur_mode != OperationalMode::Mode0Idle
-                        && !cur_mode.should_capture_input(role);
+                        && !cur_mode.should_capture_input(cfg.role);
 
                     for ev in &events {
                         if matches!(ev, HidEvent::ReleaseAllModifiers) || inject_allowed {
@@ -489,7 +617,7 @@ fn main() {
                     if epoch > state_machine.epoch() && active_mode != state_machine.current_mode()
                     {
                         apply_mode_transition(
-                            role,
+                            cfg.role,
                             &mut state_machine,
                             active_mode,
                             TransitionReason::PeerRequest,
@@ -510,7 +638,7 @@ fn main() {
                 } => {
                     block.beat_peer(now_ns);
                     let rtt_ns = now_ns.saturating_sub(origin_timestamp_ns);
-                    block.last_rtt_ns.store(rtt_ns, Ordering::Release);
+                    block.record_rtt_sample(rtt_ns);
                 }
                 WirePayload::ModeTransition {
                     target_mode,
@@ -519,7 +647,7 @@ fn main() {
                 } => {
                     block.beat_peer(now_ns);
                     apply_mode_transition(
-                        role,
+                        cfg.role,
                         &mut state_machine,
                         target_mode,
                         reason,
