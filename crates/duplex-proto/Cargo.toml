@@ -1,0 +1,11 @@
+[package]
+name = "duplex-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+bincode.workspace = true
+chacha20poly1305.workspace = true
+thiserror.workspace = true

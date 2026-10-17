@@ -1,0 +1,13 @@
+[package]
+name = "duplex-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "duplex-ctl"
+path = "src/main.rs"
+
+[dependencies]
+duplex-proto.workspace = true
+duplex-pal.workspace = true

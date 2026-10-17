@@ -1,0 +1,15 @@
+[package]
+name = "duplex-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "duplex-guard"
+path = "src/main.rs"
+
+[dependencies]
+duplex-proto.workspace = true
+duplex-pal.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

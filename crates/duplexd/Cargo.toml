@@ -1,0 +1,15 @@
+[package]
+name = "duplexd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "duplexd"
+path = "src/main.rs"
+
+[dependencies]
+duplex-proto.workspace = true
+duplex-pal.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
