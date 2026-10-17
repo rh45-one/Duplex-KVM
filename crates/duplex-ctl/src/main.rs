@@ -19,6 +19,7 @@ fn print_usage() {
     eprintln!(
         "Duplex-KVM Control & Telemetry CLI (duplex-ctl)\n\n\
          Usage:\n  \
+           duplex-ctl gui [--web]\n  \
            duplex-ctl status\n  \
            duplex-ctl watch\n  \
            duplex-ctl mode <idle | pc [--extend | --no-display] | laptop>\n  \
@@ -132,6 +133,26 @@ fn main() {
                 println!("Signaled duplexd to transition peer link to {target:?}");
             } else {
                 eprintln!("duplexd is not running (shared memory block unavailable)");
+                std::process::exit(1);
+            }
+        }
+        "gui" => {
+            let gui_bin = if cfg!(target_os = "windows") {
+                "duplex-gui.exe"
+            } else {
+                "duplex-gui"
+            };
+            let exe_path = env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join(gui_bin)))
+                .filter(|p| p.exists())
+                .unwrap_or_else(|| std::path::PathBuf::from(gui_bin));
+
+            let status = std::process::Command::new(&exe_path)
+                .args(&args[2..])
+                .status();
+            if let Err(e) = status {
+                eprintln!("Failed to launch {}: {e}", exe_path.display());
                 std::process::exit(1);
             }
         }

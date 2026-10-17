@@ -381,11 +381,11 @@ fn main() {
                     warn!("Interface {} not yet up during --check-init: {e}", cfg.local_ip);
                     return;
                 }
-                error!(
-                    "Failed to bind strict QoS sockets on {} (ensure link is connected): {e}",
+                warn!(
+                    "Interface {} not yet up ({e}); starting in MODE_0_IDLE and retrying bind when cable connects",
                     cfg.local_ip
                 );
-                std::process::exit(1);
+                None
             }
         };
 
@@ -398,6 +398,7 @@ fn main() {
     let mut state_machine = ModeStateMachine::new();
     let mut peer_physical_displays: Vec<DisplayDescriptor> = Vec::new();
     let mut last_display_adv_ns: u64 = 0;
+    let mut last_bind_retry_ns: u64 = 0;
 
     info!(
         mode = ?state_machine.current_mode(),
@@ -420,11 +421,25 @@ fn main() {
         let block = shm.block();
         block.beat_daemon(now_ns);
 
+        // Hot-plug retry: if the 1GbE link was unplugged at startup, attempt strict QoS bind every 1s
+        if transport.is_none() && now_ns.saturating_sub(last_bind_retry_ns) >= 1_000_000_000 {
+            last_bind_retry_ns = now_ns;
+            if let Ok(t) = DuplexTransport::bind_strict(cfg.role, cfg.local_ip, cfg.peer_ip, &psk) {
+                info!(
+                    local_ip = %cfg.local_ip,
+                    peer_ip = %cfg.peer_ip,
+                    "1GbE link carrier detected — strict QoS UDP/TCP transport bound"
+                );
+                transport = Some(t);
+            }
+        }
+
         // Update peer_connected status based on 250ms peer heartbeat window
-        let peer_age = now_ns.saturating_sub(block.peer_heartbeat_ns.load(Ordering::Acquire));
+        let peer_hb = block.peer_heartbeat_ns.load(Ordering::Acquire);
+        let peer_age = now_ns.saturating_sub(peer_hb);
         block
             .peer_connected
-            .store(peer_age <= WATCHDOG_TIMEOUT_NS, Ordering::Release);
+            .store(peer_hb > 0 && peer_age <= WATCHDOG_TIMEOUT_NS, Ordering::Release);
 
         // Periodically advertise our physical monitor EDIDs/specs so the peer can spawn matching virtual displays
         if now_ns.saturating_sub(last_display_adv_ns) >= DISPLAY_ADVERTISE_INTERVAL_NS {

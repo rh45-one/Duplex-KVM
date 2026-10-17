@@ -110,6 +110,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "duplex-gui"
+version = "0.1.0"
+dependencies = [
+ "duplex-pal",
+ "duplex-proto",
+ "libc",
+ "windows",
+]
+
+[[package]]
 name = "duplex-pal"
 version = "0.1.0"
 dependencies = [
