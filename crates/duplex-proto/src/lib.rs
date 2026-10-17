@@ -3,6 +3,7 @@ pub mod hid;
 pub mod keymap;
 pub mod shm;
 pub mod state;
+pub mod video;
 
 pub use crypto::{ChannelId, CryptoFrameError, CryptoSession, ReplayWindow, WirePayload};
 pub use hid::{
@@ -25,4 +26,10 @@ pub use state::{
     TransitionReason, DEBIAN_LAPTOP_IPV4, DSCP_AF41, DSCP_CS6, DSCP_EF, PORT_CONTROL_TCP,
     PORT_HID_UDP, PORT_VIDEO_STREAM_0_UDP, PORT_VIDEO_STREAM_1_UDP, TOS_CONTROL_CS6, TOS_HID_EF,
     TOS_VIDEO_AF41, WINDOWS_HOST_IPV4,
+};
+pub use video::{
+     packetize_video_frame, CursorShapeBitmap, CursorTelemetry, EncodedVideoFrame, VideoCodec,
+    VideoFragmentHeader, VideoFrameAssembler, VideoPacketError, MAX_VIDEO_BITRATE_KBPS,
+    MAX_VIDEO_FRAGMENT_PAYLOAD, VIDEO_FLAG_END_OF_FRAME, VIDEO_FLAG_KEYFRAME_IDR,
+    VIDEO_FRAGMENT_HEADER_LEN, VIDEO_FRAME_MAGIC,
 };

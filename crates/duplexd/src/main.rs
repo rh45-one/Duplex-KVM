@@ -1,11 +1,10 @@
 //! `duplexd` — Symmetric Peer-to-Peer KVM, Virtual Display & Network Multiplexer Daemon.
 //!
-//! Phase 3 integrates:
-//! - Automatic physical monitor enumeration & `WirePayload::AdvertiseDisplays` exchange
-//! - Dynamic Virtual Display provisioning (`IddCx` on Windows in Mode 1, Wayland/X11/DRM on Debian in Mode 2)
-//! - Startup Virtual Display Crash Sweeper & pre-detach Window Rescue (`rescue_windows_to_primary`)
-//! - Strict interface binding (`192.168.137.1` / `192.168.137.2`), DSCP QoS (`0xB8` EF, `0xC0` CS6),
-//!   `ChaCha20-Poly1305` framing, and 50 Hz peer heartbeats monitored by `duplex-guard`
+//! Phase 4 integrates:
+//! - Low-Latency Hardware Video Pipeline (`DXGI+NVENC/D3D11VA` on Windows <-> `PipeWire+VA-API` on Debian)
+//! - Dual-stream UDP `48102-48103` (`DSCP AF41` `0x88`) 60 Mbps CBR HEVC packetizer & reassembler
+//! - Automatic PLI (`VideoKeyframeRequest`) IDR recovery on UDP fragment gap
+//! - 1000 Hz Decoupled Hardware Cursor telemetry (`WirePayload::CursorUpdate`)
 
 mod net;
 
@@ -16,8 +15,8 @@ use duplex_pal::{
     VirtualDisplayBackend,
 };
 use duplex_proto::{
-    DisplayDescriptor, HidEvent, ModeStateMachine, NodeRole, OperationalMode, TransitionReason,
-    WirePayload, NO_REQUESTED_MODE,
+    CursorTelemetry, DisplayDescriptor, EncodedVideoFrame, HidEvent, ModeStateMachine, NodeRole,
+    OperationalMode, TransitionReason, WirePayload, MAX_VIDEO_BITRATE_KBPS, NO_REQUESTED_MODE,
 };
 use net::{default_link_ips, resolve_psk_from_env, DuplexTransport};
 use std::env;
@@ -89,14 +88,14 @@ fn parse_cli_args() -> (NodeRole, Ipv4Addr, Ipv4Addr, bool) {
     )
 }
 
-fn build_target_virtual_display_specs(
-    required_count: u8,
-    peer_displays: &[DisplayDescriptor],
+fn build_target_display_specs(
+    count: u8,
+    reference_displays: &[DisplayDescriptor],
 ) -> Vec<DisplayDescriptor> {
-    let mut specs = Vec::with_capacity(required_count as usize);
-    for idx in 0..required_count {
-        if let Some(peer_spec) = peer_displays.get(idx as usize) {
-            let mut cloned = peer_spec.clone();
+    let mut specs = Vec::with_capacity(count as usize);
+    for idx in 0..count {
+        if let Some(ref_spec) = reference_displays.get(idx as usize) {
+            let mut cloned = ref_spec.clone();
             cloned.index = idx;
             specs.push(cloned);
         } else {
@@ -126,7 +125,8 @@ fn apply_mode_transition(
     display_pal: &mut dyn VirtualDisplayBackend,
     video_pal: &mut dyn VideoPipelineBackend,
     transport: &mut Option<DuplexTransport>,
-    peer_displays: &[DisplayDescriptor],
+    local_physical_displays: &[DisplayDescriptor],
+    peer_physical_displays: &[DisplayDescriptor],
     notify_peer: bool,
 ) {
     let previous_mode = state_machine.current_mode();
@@ -158,7 +158,6 @@ fn apply_mode_transition(
     let _ = input_pal.release_all_stuck_keys();
 
     if effective_target.should_capture_input(role) {
-        // Refresh peer heartbeat timestamp when entering an active mode so duplex-guard has a clean 250ms window
         block.beat_peer(now_ns);
         if let Err(e) = input_pal.start_capture() {
             error!("Failed to start input capture for {effective_target:?}: {e}");
@@ -175,14 +174,12 @@ fn apply_mode_transition(
         let _ = input_pal.stop_capture();
     }
 
-    // Synchronize virtual displays & window rescue for the new mode
+    // Synchronize virtual displays, hardware video encoder/viewer pipelines, and window rescue
     let required_vdisplays = effective_target.required_virtual_displays(role);
-    if required_vdisplays == 0 {
-        let _ = video_pal.close_all_viewer_windows();
-        let _ = display_pal.destroy_all_virtual_displays();
-        block.virtual_displays_active.store(0, Ordering::Release);
-    } else {
-        let target_specs = build_target_virtual_display_specs(required_vdisplays, peer_displays);
+    let expected_viewers = effective_target.expected_incoming_video_streams(role);
+
+    if required_vdisplays > 0 {
+        let target_specs = build_target_display_specs(required_vdisplays, peer_physical_displays);
         if let Err(e) = display_pal.sync_virtual_displays(&target_specs) {
             warn!("VirtualDisplayBackend sync_virtual_displays reported warning: {e}");
         }
@@ -190,6 +187,28 @@ fn apply_mode_transition(
             display_pal.active_virtual_displays().len() as u8,
             Ordering::Release,
         );
+        if let Err(e) = video_pal.start_sender(&target_specs, MAX_VIDEO_BITRATE_KBPS) {
+            warn!("VideoPipelineBackend start_sender reported warning: {e}");
+        }
+    } else if expected_viewers > 0 {
+        let _ = display_pal.destroy_all_virtual_displays();
+        block.virtual_displays_active.store(0, Ordering::Release);
+
+        let viewer_specs = build_target_display_specs(expected_viewers, local_physical_displays);
+        if let Err(e) = video_pal.start_viewer(&viewer_specs) {
+            warn!("VideoPipelineBackend start_viewer reported warning: {e}");
+        }
+        if let Some(ref mut net_tx) = transport {
+            for idx in 0..expected_viewers {
+                let _ = net_tx.send_control_payload(&WirePayload::VideoKeyframeRequest {
+                    monitor_index: idx,
+                });
+            }
+        }
+    } else {
+        let _ = video_pal.close_all_viewer_windows();
+        let _ = display_pal.destroy_all_virtual_displays();
+        block.virtual_displays_active.store(0, Ordering::Release);
     }
 
     block
@@ -200,6 +219,7 @@ fn apply_mode_transition(
         to = ?effective_target,
         ?reason,
         required_vdisplays,
+        expected_viewers,
         epoch = state_machine.epoch(),
         "Applied symmetric operational mode transition"
     );
@@ -218,7 +238,7 @@ fn main() {
         ?role,
         %local_ip,
         %peer_ip,
-        "Initializing duplexd symmetric KVM daemon (Phase 3)"
+        "Initializing duplexd symmetric KVM & Hardware Video daemon (Phase 4)"
     );
 
     let shm = Arc::new(
@@ -230,10 +250,11 @@ fn main() {
     let mut video_pal =
         create_video_pipeline_backend().expect("Failed to create VideoPipelineBackend");
 
-    // Mandatory Startup Crash Sweeper: destroy any orphaned virtual monitors from a prior crash
+    // Mandatory Startup Crash Sweeper: destroy any orphaned virtual monitors & viewer overlays
     if let Err(e) = display_pal.sweep_orphaned_displays() {
         warn!("Startup virtual display crash sweeper warning: {e}");
     }
+    let _ = video_pal.close_all_viewer_windows();
 
     let local_physical_displays = display_pal.enumerate_physical_displays().unwrap_or_default();
     info!(
@@ -266,7 +287,7 @@ fn main() {
 
     info!(
         mode = ?state_machine.current_mode(),
-        "duplexd active in MODE_0_IDLE with Virtual Display Controller & Window Rescue armed"
+        "duplexd active in MODE_0_IDLE with Hardware Video Pipeline & Decoupled Cursor ready"
     );
 
     if check_only {
@@ -276,6 +297,9 @@ fn main() {
     let mut captured_buf: Vec<CapturedInputEvent> = Vec::with_capacity(64);
     let mut outgoing_hid_buf: Vec<HidEvent> = Vec::with_capacity(64);
     let mut incoming_payloads: Vec<WirePayload> = Vec::with_capacity(32);
+    let mut encoded_video_buf: Vec<EncodedVideoFrame> = Vec::with_capacity(8);
+    let mut incoming_video_buf: Vec<EncodedVideoFrame> = Vec::with_capacity(8);
+    let mut pli_monitors_buf: Vec<u8> = Vec::with_capacity(4);
 
     loop {
         let now_ns = monotonic_now_ns();
@@ -307,6 +331,7 @@ fn main() {
                 display_pal.as_mut(),
                 video_pal.as_mut(),
                 &mut transport,
+                &local_physical_displays,
                 &peer_physical_displays,
                 true,
             );
@@ -326,6 +351,7 @@ fn main() {
                 display_pal.as_mut(),
                 video_pal.as_mut(),
                 &mut transport,
+                &local_physical_displays,
                 &peer_physical_displays,
                 true,
             );
@@ -375,13 +401,37 @@ fn main() {
                 display_pal.as_mut(),
                 video_pal.as_mut(),
                 &mut transport,
+                &local_physical_displays,
                 &peer_physical_displays,
                 true,
             );
         }
 
-        // 4. Tick 50 Hz CS6 (0xC0) Heartbeat & poll incoming encrypted frames
+        // 4. Poll hardware-encoded HEVC video frames & decoupled 1000 Hz cursor telemetry
+        if state_machine.current_mode().should_stream_video(role) {
+            encoded_video_buf.clear();
+            let mut cursor_telemetry_opt: Option<CursorTelemetry> = None;
+            if let Ok(frame_count) =
+                video_pal.poll_encoded_frames(&mut encoded_video_buf, &mut cursor_telemetry_opt)
+            {
+                if let Some(ref mut net_tx) = transport {
+                    if let Some(cursor) = cursor_telemetry_opt.take() {
+                        let _ = net_tx.send_cursor_update(cursor);
+                    }
+                    if frame_count > 0 {
+                        for frame in &encoded_video_buf {
+                            net_tx.send_video_frame(frame);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Tick 50 Hz CS6 (0xC0) Heartbeat & poll incoming encrypted HID/Control/Video frames
         incoming_payloads.clear();
+        incoming_video_buf.clear();
+        pli_monitors_buf.clear();
+
         if let Some(ref mut net_io) = transport {
             net_io.tick_heartbeat(
                 state_machine.current_mode(),
@@ -389,6 +439,18 @@ fn main() {
                 now_ns,
             );
             net_io.poll_incoming(&mut incoming_payloads);
+            net_io.poll_incoming_video(&mut incoming_video_buf, &mut pli_monitors_buf);
+
+            for mon_idx in pli_monitors_buf.drain(..) {
+                let _ = net_io.send_control_payload(&WirePayload::VideoKeyframeRequest {
+                    monitor_index: mon_idx,
+                });
+            }
+        }
+
+        for frame in incoming_video_buf.drain(..) {
+            block.beat_peer(now_ns);
+            let _ = video_pal.submit_encoded_frame(&frame);
         }
 
         for payload in incoming_payloads.drain(..) {
@@ -400,11 +462,14 @@ fn main() {
                         && !cur_mode.should_capture_input(role);
 
                     for ev in &events {
-                        // Always honor ReleaseAllModifiers even if already in Mode0Idle
                         if matches!(ev, HidEvent::ReleaseAllModifiers) || inject_allowed {
                             let _ = input_pal.inject_hid_event(ev);
                         }
                     }
+                }
+                WirePayload::CursorUpdate(cursor) => {
+                    block.beat_peer(now_ns);
+                    let _ = video_pal.update_hardware_cursor(&cursor);
                 }
                 WirePayload::Heartbeat {
                     sender_timestamp_ns,
@@ -433,6 +498,7 @@ fn main() {
                             display_pal.as_mut(),
                             video_pal.as_mut(),
                             &mut transport,
+                            &local_physical_displays,
                             &peer_physical_displays,
                             false,
                         );
@@ -462,6 +528,7 @@ fn main() {
                         display_pal.as_mut(),
                         video_pal.as_mut(),
                         &mut transport,
+                        &local_physical_displays,
                         &peer_physical_displays,
                         false,
                     );
@@ -476,10 +543,14 @@ fn main() {
                         peer_physical_displays = displays;
                     }
                 }
+                WirePayload::VideoKeyframeRequest { monitor_index } => {
+                    block.beat_peer(now_ns);
+                    let _ = video_pal.request_keyframe(monitor_index);
+                }
             }
         }
 
-        // 500µs–1ms low-latency poll cadence for 1000Hz USB HID responsiveness
+        // 500µs–1ms low-latency poll cadence for 1000Hz USB HID & decoupled cursor responsiveness
         thread::sleep(Duration::from_micros(500));
     }
 }

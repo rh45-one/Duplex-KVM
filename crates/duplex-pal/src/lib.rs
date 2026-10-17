@@ -12,7 +12,7 @@ pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use duplex_proto::{DisplayDescriptor, HidEvent, PanicTriggerKind};
+use duplex_proto::{CursorTelemetry, DisplayDescriptor, EncodedVideoFrame, HidEvent, PanicTriggerKind};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -85,7 +85,34 @@ pub trait VirtualDisplayBackend: Send {
 
 /// Cross-platform Low-Latency Hardware Video Pipeline (`DXGI+NVENC/D3D11VA` on Windows, `PipeWire+VA-API` on Debian Linux).
 pub trait VideoPipelineBackend: Send {
-    /// Immediately destroys all borderless fullscreen hardware-decoded viewer windows.
+    /// Starts capturing the specified virtual monitors (with hardware cursor decoupled/hidden in capture)
+    /// and hardware-encoding low-latency HEVC streams capped at `max_bitrate_kbps` (60 Mbps) per monitor.
+    fn start_sender(
+        &mut self,
+        monitors: &[DisplayDescriptor],
+        max_bitrate_kbps: u32,
+    ) -> Result<(), PalError>;
+
+    /// Non-blocking poll draining encoded HEVC access units and decoupled hardware cursor telemetry.
+    fn poll_encoded_frames(
+        &mut self,
+        out_frames: &mut Vec<EncodedVideoFrame>,
+        out_cursor: &mut Option<CursorTelemetry>,
+    ) -> Result<usize, PalError>;
+
+    /// Forces an immediate IDR keyframe on `monitor_index` (in response to a PLI request or viewer attach).
+    fn request_keyframe(&mut self, monitor_index: u8) -> Result<(), PalError>;
+
+    /// Spawns borderless fullscreen hardware-decoded viewer windows (`VA-API` on Debian, `D3D11VA` on Windows).
+    fn start_viewer(&mut self, monitors: &[DisplayDescriptor]) -> Result<(), PalError>;
+
+    /// Submits a reassembled hardware-encoded HEVC access unit to the fullscreen viewer decoder for `frame.monitor_index`.
+    fn submit_encoded_frame(&mut self, frame: &EncodedVideoFrame) -> Result<(), PalError>;
+
+    /// Updates the decoupled hardware cursor position/shape directly on the viewer display at 1000 Hz.
+    fn update_hardware_cursor(&mut self, cursor: &CursorTelemetry) -> Result<(), PalError>;
+
+    /// Immediately stops all encoders/decoders and destroys all borderless fullscreen viewer windows.
     fn close_all_viewer_windows(&mut self) -> Result<(), PalError>;
 }
 

@@ -1,16 +1,19 @@
 //! Encrypted QoS Network Transport Multiplexer (`duplexd::net`).
 //!
-//! Manages the strictly bound (`192.168.137.1` / `192.168.137.2`) UDP HID stream (`48100`, `DSCP EF` `0xB8`)
-//! and 50 Hz Control/Heartbeat channel (`48101`, `DSCP CS6` `0xC0`) using zero-allocation in-place
-//! `ChaCha20-Poly1305` packet framing and 64-bit monotonic sequence anti-replay windows.
+//! Manages strictly bound (`192.168.137.1` / `192.168.137.2`) sockets across all three QoS tiers:
+//! - **HID Stream (`UDP 48100`, `DSCP EF` -> `IP_TOS 0xB8`):** Zero-allocation in-place `ChaCha20-Poly1305`
+//! - **Control & 50 Hz Heartbeat (`TCP/UDP 48101`, `DSCP CS6` -> `IP_TOS 0xC0`):** `ChaCha20-Poly1305`
+//! - **Hardware Video Streams (`UDP 48102-48103`, `DSCP AF41` -> `IP_TOS 0x88`):** MTU-safe (`1380B`)
+//!   HEVC slice packetizer & `VideoFrameAssembler` with automatic PLI keyframe recovery.
 
 use duplex_pal::{
     bind_qos_tcp_listener, bind_qos_udp_socket, configure_tcp_stream_qos, PalError, QosClass,
 };
 use duplex_proto::{
-    ChannelId, CryptoSession, HidEvent, NodeRole, OperationalMode, TransitionReason, WirePayload,
+    packetize_video_frame, ChannelId, CryptoSession, CursorTelemetry, EncodedVideoFrame, HidEvent,
+    NodeRole, OperationalMode, TransitionReason, VideoFrameAssembler, WirePayload,
     DEBIAN_LAPTOP_IPV4, PEER_HEARTBEAT_INTERVAL_NS, PORT_CONTROL_TCP, PORT_HID_UDP,
-    WINDOWS_HOST_IPV4,
+    PORT_VIDEO_STREAM_0_UDP, PORT_VIDEO_STREAM_1_UDP, WINDOWS_HOST_IPV4,
 };
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
@@ -87,16 +90,25 @@ pub fn resolve_psk_from_env() -> [u8; 32] {
     DEFAULT_LINK_PSK
 }
 
-/// Symmetric encrypted transport managing UDP 48100 (HID, DSCP EF `0xB8`) and
-/// TCP/UDP 48101 (Control & 50 Hz Heartbeat, DSCP CS6 `0xC0`).
+/// Symmetric encrypted & QoS-tagged transport managing:
+/// - UDP `48100` (HID, DSCP EF `0xB8`)
+/// - TCP/UDP `48101` (Control & 50 Hz Heartbeat, DSCP CS6 `0xC0`)
+/// - UDP `48102` & `48103` (Dual-Monitor HEVC Video Streams, DSCP AF41 `0x88`)
 pub struct DuplexTransport {
     role: NodeRole,
     peer_hid_addr: SocketAddr,
     peer_ctrl_addr: SocketAddr,
+    peer_video_0_addr: SocketAddr,
+    peer_video_1_addr: SocketAddr,
     hid_udp: UdpSocket,
     ctrl_udp: UdpSocket,
     ctrl_tcp_listener: TcpListener,
     ctrl_tcp_stream: Option<TcpStream>,
+    video_0_udp: UdpSocket,
+    video_1_udp: UdpSocket,
+    video_assembler_0: VideoFrameAssembler,
+    video_assembler_1: VideoFrameAssembler,
+    video_dgram_scratch: Vec<Vec<u8>>,
     hid_crypto: CryptoSession,
     ctrl_crypto: CryptoSession,
     tx_scratch: Vec<u8>,
@@ -119,6 +131,16 @@ impl DuplexTransport {
             bind_qos_udp_socket(local_ip, PORT_CONTROL_TCP, QosClass::ControlNetworkControl)?;
         let ctrl_tcp_listener =
             bind_qos_tcp_listener(local_ip, PORT_CONTROL_TCP, QosClass::ControlNetworkControl)?;
+        let video_0_udp = bind_qos_udp_socket(
+            local_ip,
+            PORT_VIDEO_STREAM_0_UDP,
+            QosClass::VideoAssuredForwarding,
+        )?;
+        let video_1_udp = bind_qos_udp_socket(
+            local_ip,
+            PORT_VIDEO_STREAM_1_UDP,
+            QosClass::VideoAssuredForwarding,
+        )?;
 
         let (hid_tx_ch, hid_rx_ch, ctrl_tx_ch, ctrl_rx_ch) = match role {
             NodeRole::DebianLaptop => (
@@ -137,6 +159,8 @@ impl DuplexTransport {
 
         let peer_hid_addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, PORT_HID_UDP));
         let peer_ctrl_addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, PORT_CONTROL_TCP));
+        let peer_video_0_addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, PORT_VIDEO_STREAM_0_UDP));
+        let peer_video_1_addr = SocketAddr::V4(SocketAddrV4::new(peer_ip, PORT_VIDEO_STREAM_1_UDP));
 
         info!(
             ?role,
@@ -144,17 +168,25 @@ impl DuplexTransport {
             %peer_ip,
             hid_port = PORT_HID_UDP,
             ctrl_port = PORT_CONTROL_TCP,
-            "Bound strict QoS sockets (UDP 48100 TOS=0xB8 EF, TCP/UDP 48101 TOS=0xC0 CS6)"
+            video_ports = ?(PORT_VIDEO_STREAM_0_UDP, PORT_VIDEO_STREAM_1_UDP),
+            "Bound strict QoS sockets (EF=0xB8, CS6=0xC0, AF41=0x88)"
         );
 
         Ok(Self {
             role,
             peer_hid_addr,
             peer_ctrl_addr,
+            peer_video_0_addr,
+            peer_video_1_addr,
             hid_udp,
             ctrl_udp,
             ctrl_tcp_listener,
             ctrl_tcp_stream: None,
+            video_0_udp,
+            video_1_udp,
+            video_assembler_0: VideoFrameAssembler::new(0),
+            video_assembler_1: VideoFrameAssembler::new(1),
+            video_dgram_scratch: Vec::with_capacity(64),
             hid_crypto: CryptoSession::new(psk, hid_tx_ch, hid_rx_ch),
             ctrl_crypto: CryptoSession::new(psk, ctrl_tx_ch, ctrl_rx_ch),
             tx_scratch: Vec::with_capacity(512),
@@ -166,14 +198,12 @@ impl DuplexTransport {
     }
 
     /// Coalesces micro-deltas and transmits an encrypted `WirePayload::HidBatch` over UDP 48100 (`DSCP EF`).
-    /// Uses `seal_frame_into` with `self.tx_scratch` for zero heap allocations on the hot path.
     pub fn send_hid_events(&mut self, raw_events: &[HidEvent], now_ns: u64) -> Result<(), PalError> {
         if raw_events.is_empty() {
             return Ok(());
         }
         coalesce_hid_events(raw_events, &mut self.coalesce_scratch);
 
-        // Move coalesced events into payload temporarily to serialize without extra allocation
         let events = core::mem::take(&mut self.coalesce_scratch);
         let payload = WirePayload::HidBatch {
             sender_timestamp_ns: now_ns,
@@ -185,7 +215,6 @@ impl DuplexTransport {
             .seal_frame_into(&payload, &mut self.tx_scratch)
             .map_err(|e| PalError::Network(format!("HID seal_frame_into failed: {e}")));
 
-        // Reclaim Vec capacity back into `self.coalesce_scratch`
         if let WirePayload::HidBatch { mut events, .. } = payload {
             events.clear();
             self.coalesce_scratch = events;
@@ -194,6 +223,30 @@ impl DuplexTransport {
         res?;
         let _ = self.hid_udp.send_to(&self.tx_scratch, self.peer_hid_addr);
         Ok(())
+    }
+
+    /// Transmits a decoupled 1000 Hz hardware cursor update out-of-band over the `DSCP EF` (`0xB8`) socket.
+    pub fn send_cursor_update(&mut self, cursor: CursorTelemetry) -> Result<(), PalError> {
+        let payload = WirePayload::CursorUpdate(cursor);
+        self.hid_crypto
+            .seal_frame_into(&payload, &mut self.tx_scratch)
+            .map_err(|e| PalError::Network(format!("Cursor seal_frame_into failed: {e}")))?;
+        let _ = self.hid_udp.send_to(&self.tx_scratch, self.peer_hid_addr);
+        Ok(())
+    }
+
+    /// Packetizes a hardware-encoded HEVC access unit into MTU-safe (`<= 1404B`) datagrams
+    /// and transmits them over UDP `48102` (Monitor 0) or `48103` (Monitor 1) tagged with `DSCP AF41` (`0x88`).
+    pub fn send_video_frame(&mut self, frame: &EncodedVideoFrame) {
+        packetize_video_frame(frame, &mut self.video_dgram_scratch);
+        let (sock, target_addr) = if frame.monitor_index == 0 {
+            (&self.video_0_udp, self.peer_video_0_addr)
+        } else {
+            (&self.video_1_udp, self.peer_video_1_addr)
+        };
+        for dgram in &self.video_dgram_scratch {
+            let _ = sock.send_to(dgram, target_addr);
+        }
     }
 
     /// Transmits a redundant 3-datagram high-priority burst of `HidEvent::ReleaseAllModifiers`
@@ -206,16 +259,15 @@ impl DuplexTransport {
         }
     }
 
-    /// Broadcasts a control payload (`Heartbeat`, `HeartbeatAck`, `ModeTransition`) over the CS6 control channel.
+    /// Broadcasts a control payload (`Heartbeat`, `HeartbeatAck`, `ModeTransition`, `AdvertiseDisplays`, `VideoKeyframeRequest`)
+    /// over the CS6 control channel.
     pub fn send_control_payload(&mut self, payload: &WirePayload) -> Result<(), PalError> {
         self.ctrl_crypto
             .seal_frame_into(payload, &mut self.tx_scratch)
             .map_err(|e| PalError::Network(format!("Control seal_frame_into failed: {e}")))?;
 
-        // Always transmit over the low-jitter CS6 UDP control datagram socket
         let _ = self.ctrl_udp.send_to(&self.tx_scratch, self.peer_ctrl_addr);
 
-        // Also transmit over the TCP control stream if connected
         if let Some(ref mut stream) = self.ctrl_tcp_stream {
             let len = self.tx_scratch.len() as u16;
             let header = len.to_be_bytes();
@@ -242,13 +294,7 @@ impl DuplexTransport {
     }
 
     /// Non-blocking 50 Hz (`20ms`) heartbeat transmitter & TCP connection maintenance.
-    pub fn tick_heartbeat(
-        &mut self,
-        active_mode: OperationalMode,
-        epoch: u64,
-        now_ns: u64,
-    ) {
-        // Accept any incoming TCP control connection
+    pub fn tick_heartbeat(&mut self, active_mode: OperationalMode, epoch: u64, now_ns: u64) {
         if let Ok((stream, peer_addr)) = self.ctrl_tcp_listener.accept() {
             if configure_tcp_stream_qos(&stream, QosClass::ControlNetworkControl).is_ok() {
                 debug!(%peer_addr, "Accepted incoming CS6 TCP control connection");
@@ -280,9 +326,9 @@ impl DuplexTransport {
         }
     }
 
-    /// Non-blocking poll draining all authenticated HID and Control packets from UDP 48100 and TCP/UDP 48101.
+    /// Non-blocking poll draining all authenticated HID, Cursor, and Control packets from UDP 48100 and TCP/UDP 48101.
     pub fn poll_incoming(&mut self, out_payloads: &mut Vec<WirePayload>) {
-        // 1. Drain high-priority HID UDP 48100 packets
+        // 1. Drain high-priority HID & Decoupled Cursor UDP 48100 packets
         while let Ok((len, src_addr)) = self.hid_udp.recv_from(&mut self.rx_scratch) {
             if src_addr.ip() != self.peer_hid_addr.ip() {
                 continue;
@@ -326,6 +372,46 @@ impl DuplexTransport {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     self.ctrl_tcp_stream = None;
+                }
+            }
+        }
+    }
+
+    /// Non-blocking poll draining incoming `DSCP AF41` (`0x88`) HEVC video datagrams on UDP `48102` and `48103`.
+    /// Reassembles complete access units and flags any packet loss for immediate PLI keyframe recovery.
+    pub fn poll_incoming_video(
+        &mut self,
+        out_frames: &mut Vec<EncodedVideoFrame>,
+        out_pli_monitors: &mut Vec<u8>,
+    ) {
+        while let Ok((len, src_addr)) = self.video_0_udp.recv_from(&mut self.rx_scratch) {
+            if src_addr.ip() != self.peer_video_0_addr.ip() {
+                continue;
+            }
+            if let Ok((frame_opt, gap)) =
+                self.video_assembler_0.push_datagram(&self.rx_scratch[..len])
+            {
+                if gap {
+                    out_pli_monitors.push(0);
+                }
+                if let Some(frame) = frame_opt {
+                    out_frames.push(frame);
+                }
+            }
+        }
+
+        while let Ok((len, src_addr)) = self.video_1_udp.recv_from(&mut self.rx_scratch) {
+            if src_addr.ip() != self.peer_video_1_addr.ip() {
+                continue;
+            }
+            if let Ok((frame_opt, gap)) =
+                self.video_assembler_1.push_datagram(&self.rx_scratch[..len])
+            {
+                if gap {
+                    out_pli_monitors.push(1);
+                }
+                if let Some(frame) = frame_opt {
+                    out_frames.push(frame);
                 }
             }
         }

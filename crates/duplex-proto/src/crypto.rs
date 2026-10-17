@@ -5,6 +5,7 @@
 
 use crate::hid::HidEvent;
 use crate::state::{DisplayDescriptor, NodeRole, OperationalMode, TransitionReason};
+use crate::video::CursorTelemetry;
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     ChaCha20Poly1305, Key, Nonce, Tag,
@@ -39,7 +40,9 @@ pub enum WirePayload {
         sender_timestamp_ns: u64,
         events: Vec<HidEvent>,
     },
-    /// 50 Hz peer liveness heartbeat (sent every 20ms over TCP 48101, DSCP CS6).
+    /// Decoupled hardware cursor position & shape bitmap update (sent out-of-band from video).
+    CursorUpdate(CursorTelemetry),
+    /// 50 Hz peer liveness heartbeat (sent every 20ms over TCP/UDP 48101, DSCP CS6).
     Heartbeat {
         sender_role: NodeRole,
         active_mode: OperationalMode,
@@ -62,6 +65,10 @@ pub enum WirePayload {
     AdvertiseDisplays {
         role: NodeRole,
         displays: Vec<DisplayDescriptor>,
+    },
+    /// Picture Loss Indication (PLI) requesting an immediate IDR keyframe on `monitor_index`.
+    VideoKeyframeRequest {
+        monitor_index: u8,
     },
 }
 

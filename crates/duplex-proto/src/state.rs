@@ -103,6 +103,24 @@ impl OperationalMode {
             (Self::Mode2LaptopPrimary, NodeRole::WindowsDesktop) => 0,
         }
     }
+
+    /// Returns true if the given node role captures and hardware-encodes virtual displays in this mode.
+    #[inline]
+    pub const fn should_stream_video(self, role: NodeRole) -> bool {
+        self.required_virtual_displays(role) > 0
+    }
+
+    /// Returns the number of incoming hardware-decoded fullscreen viewer windows the given node role must open.
+    #[inline]
+    pub const fn expected_incoming_video_streams(self, role: NodeRole) -> u8 {
+        match (self, role) {
+            (Self::Mode0Idle, _) => 0,
+            (Self::Mode1PcPrimary { extend_display: true }, NodeRole::DebianLaptop) => 1,
+            (Self::Mode1PcPrimary { .. }, _) => 0,
+            (Self::Mode2LaptopPrimary, NodeRole::WindowsDesktop) => 2,
+            (Self::Mode2LaptopPrimary, NodeRole::DebianLaptop) => 0,
+        }
+    }
 }
 
 /// Cause of a state machine transition.
