@@ -14,7 +14,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Duplex Systems Engineering"]
-repository = "https://github.com/duplex-kvm/duplex-kvm"
+repository = "https://github.com/rh45-one/Duplex-KVM"
 
 [workspace.dependencies]
 duplex-proto = { path = "crates/duplex-proto" }

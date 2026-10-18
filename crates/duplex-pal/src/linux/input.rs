@@ -363,6 +363,8 @@ pub struct LinuxInputBackend {
     touchpad_touch_start_ns: u64,
     touchpad_tap_motion: i32,
     touchpad_max_fingers: u8,
+    touchpad_last_tap_release_ns: u64,
+    touchpad_dragging: bool,
     last_hotkey_ns: u64,
 }
 
@@ -407,6 +409,8 @@ impl LinuxInputBackend {
             touchpad_touch_start_ns: 0,
             touchpad_tap_motion: 0,
             touchpad_max_fingers: 0,
+            touchpad_last_tap_release_ns: 0,
+            touchpad_dragging: false,
             last_hotkey_ns: 0,
         };
         backend.open_passive_hotkey_listeners();
@@ -634,6 +638,8 @@ impl LinuxInputBackend {
         self.touchpad_touch_start_ns = 0;
         self.touchpad_tap_motion = 0;
         self.touchpad_max_fingers = 0;
+        self.touchpad_last_tap_release_ns = 0;
+        self.touchpad_dragging = false;
     }
 }
 
@@ -785,28 +791,62 @@ impl InputBackend for LinuxInputBackend {
                                     if self.touchpad_max_fingers == 0 {
                                         self.touchpad_max_fingers = 1;
                                     }
-                                } else {
-                                    // Check for tap-to-click (<180ms and <45 units of finger travel)
-                                    let dur_ns =
-                                        now_ns.saturating_sub(self.touchpad_touch_start_ns);
-                                    if self.touchpad_touch_active
-                                        && dur_ns <= 180_000_000
-                                        && self.touchpad_tap_motion < 45
+
+                                    // Tap-and-hold (tap-to-drag): check if this touch-down arrived within
+                                    // 280ms of a preceding single-finger tap release
+                                    let time_since_last_tap =
+                                        now_ns.saturating_sub(self.touchpad_last_tap_release_ns);
+                                    if self.touchpad_last_tap_release_ns > 0
+                                        && time_since_last_tap <= 280_000_000
+                                        && !self.touchpad_two_finger
                                     {
-                                        let btn = if self.touchpad_max_fingers >= 2 {
-                                            HidMouseButton::Right
-                                        } else {
-                                            HidMouseButton::Left
-                                        };
+                                        self.touchpad_dragging = true;
+                                        self.touchpad_last_tap_release_ns = 0;
                                         out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                            button: btn,
+                                            button: HidMouseButton::Left,
                                             pressed: true,
                                         }));
+                                        pushed += 1;
+                                    }
+                                } else {
+                                    if self.touchpad_dragging {
+                                        self.touchpad_dragging = false;
+                                        self.touchpad_last_tap_release_ns = 0;
                                         out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                            button: btn,
+                                            button: HidMouseButton::Left,
                                             pressed: false,
                                         }));
-                                        pushed += 2;
+                                        pushed += 1;
+                                    } else {
+                                        // Check for tap-to-click (<180ms and <45 units of finger travel)
+                                        let dur_ns =
+                                            now_ns.saturating_sub(self.touchpad_touch_start_ns);
+                                        if self.touchpad_touch_active
+                                            && dur_ns <= 180_000_000
+                                            && self.touchpad_tap_motion < 45
+                                        {
+                                            let btn = if self.touchpad_max_fingers >= 2 {
+                                                HidMouseButton::Right
+                                            } else {
+                                                HidMouseButton::Left
+                                            };
+                                            out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                                                button: btn,
+                                                pressed: true,
+                                            }));
+                                            out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                                                button: btn,
+                                                pressed: false,
+                                            }));
+                                            pushed += 2;
+                                            if btn == HidMouseButton::Left {
+                                                self.touchpad_last_tap_release_ns = now_ns;
+                                            } else {
+                                                self.touchpad_last_tap_release_ns = 0;
+                                            }
+                                        } else {
+                                            self.touchpad_last_tap_release_ns = 0;
+                                        }
                                     }
                                     self.touchpad_touch_active = false;
                                     self.touchpad_last_x = None;
@@ -820,6 +860,15 @@ impl InputBackend for LinuxInputBackend {
 
                             if ev.code == BTN_TOOL_DOUBLETAP {
                                 self.touchpad_two_finger = pressed;
+                                if pressed && self.touchpad_dragging {
+                                    self.touchpad_dragging = false;
+                                    self.touchpad_last_tap_release_ns = 0;
+                                    out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                                        button: HidMouseButton::Left,
+                                        pressed: false,
+                                    }));
+                                    pushed += 1;
+                                }
                                 // Reset reference coordinates when switching between 1-finger and 2-finger
                                 self.touchpad_last_x = None;
                                 self.touchpad_last_y = None;
@@ -849,6 +898,10 @@ impl InputBackend for LinuxInputBackend {
                             };
 
                             if let Some(button) = mouse_btn {
+                                if self.touchpad_dragging && button == HidMouseButton::Left {
+                                    self.touchpad_dragging = false;
+                                    self.touchpad_last_tap_release_ns = 0;
+                                }
                                 out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
                                     button,
                                     pressed,

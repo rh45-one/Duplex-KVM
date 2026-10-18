@@ -10,6 +10,7 @@
 //! - **`--setup` / `setup`**: Executes the embedded OS network & permissions setup script.
 //! - **`status` | `watch` | `mode` | `panic`**: Operator CLI subcommands.
 
+pub mod design;
 pub mod web;
 
 #[cfg(target_os = "linux")]
