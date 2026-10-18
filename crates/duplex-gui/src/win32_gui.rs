@@ -34,10 +34,12 @@ const ID_TIMER_TELEMETRY: usize = 2001;
 use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU16, Ordering};
+use std::sync::Mutex;
 
 static TELEMETRY_HWND: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static STATUS_HWND: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static WEB_PORT_WIN: AtomicU16 = AtomicU16::new(48180);
+static LAST_TELEMETRY_TEXT: Mutex<String> = Mutex::new(String::new());
 
 fn wide_null(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(core::iter::once(0)).collect()
@@ -74,8 +76,8 @@ unsafe fn update_telemetry_label() {
          Daemon Status        : {}\r\n\
          Peer 1GbE Link       : {}\r\n\
          Input Grab & Disp    : {}  |  Virtual Displays: {}\r\n\
-         Heartbeat Age        : Daemon: {:.1} ms  |  Peer: {:.1} ms\r\n\
-         Link RTT (min/cur/max): {:.1} us / {:.1} us / {:.1} us\r\n\
+         Global Mode Hotkey   : Ctrl+Alt+P (Cycle)  |  Ctrl+Alt+0..3 (Direct)\r\n\
+         Link RTT (min/cur/max): {:.0} us / {:.0} us / {:.0} us\r\n\
          HID Batches (TX/RX)  : {} / {}  (UDP 48100 DSCP EF 0xB8)\r\n\
          Video Frames (TX/RX) : {} / {}  (UDP 48102-3 DSCP AF41 0x88)\r\n\
          PLI Keyframe Recover : {}",
@@ -85,8 +87,6 @@ unsafe fn update_telemetry_label() {
         peer_str,
         grab_str,
         snap.virtual_displays_active,
-        snap.daemon_age_ms,
-        snap.peer_age_ms,
         snap.min_rtt_us,
         snap.last_rtt_us,
         snap.max_rtt_us,
@@ -97,8 +97,21 @@ unsafe fn update_telemetry_label() {
         snap.pli_keyframes_requested,
     );
 
-    let hwnd = HWND(TELEMETRY_HWND.load(Ordering::Acquire));
-    set_window_text_str(hwnd, &text);
+    let should_update = if let Ok(mut prev) = LAST_TELEMETRY_TEXT.lock() {
+        if *prev != text {
+            *prev = text.clone();
+            true
+        } else {
+            false
+        }
+    } else {
+        true
+    };
+
+    if should_update {
+        let hwnd = HWND(TELEMETRY_HWND.load(Ordering::Acquire));
+        set_window_text_str(hwnd, &text);
+    }
 }
 
 unsafe fn create_child_control(
@@ -166,7 +179,7 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "BUTTON",
-                "Mode 0 - Idle (Local Only + 1GbE Internet Passthrough)",
+                "Mode 0 - Idle (Local Only + 1GbE Passthrough)  [Ctrl+Alt+0]",
                 btn_style,
                 18,
                 222,
@@ -178,7 +191,7 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "BUTTON",
-                "Mode 1 - PC Primary (Laptop Controls Windows PC, KVM Input Only)",
+                "Mode 1 - PC Primary (Laptop Controls Windows PC, Input Only)  [Ctrl+Alt+1]",
                 btn_style,
                 18,
                 262,
@@ -190,7 +203,7 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "BUTTON",
-                "Mode 1+ - PC Primary (Laptop Controls PC + Extend 1 Virtual Display)",
+                "Mode 1+ - PC Primary (Laptop Controls PC + Extend Display)  [Ctrl+Alt+2]",
                 btn_style,
                 18,
                 302,
@@ -202,7 +215,7 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "BUTTON",
-                "Mode 2 - Laptop Primary (Dock Windows Dual Monitors & Peripherals to Laptop)",
+                "Mode 2 - Laptop Primary (Dock Windows Dual Monitors to Laptop)  [Ctrl+Alt+3]",
                 btn_style,
                 18,
                 342,
@@ -265,7 +278,7 @@ unsafe extern "system" fn wnd_proc(
                 hwnd,
                 hinst,
                 "STATIC",
-                &format!("Ready - Web UI also active at http://127.0.0.1:{port}"),
+                &format!("Ready - Press Ctrl+Alt+P anytime to cycle modes (http://127.0.0.1:{port})"),
                 WINDOW_STYLE(0),
                 18,
                 482,
@@ -276,7 +289,7 @@ unsafe extern "system" fn wnd_proc(
             STATUS_HWND.store(stat_hwnd.0, Ordering::Release);
 
             update_telemetry_label();
-            let _ = SetTimer(hwnd, ID_TIMER_TELEMETRY, 100, None);
+            let _ = SetTimer(hwnd, ID_TIMER_TELEMETRY, 250, None);
             LRESULT(0)
         }
         WM_TIMER => {

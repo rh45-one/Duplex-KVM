@@ -53,6 +53,7 @@ extern "C" {
 
     fn gtk_widget_show_all(widget: *mut c_void);
     fn gtk_widget_set_name(widget: *mut c_void, name: *const c_char);
+    fn gtk_widget_set_size_request(widget: *mut c_void, width: c_int, height: c_int);
 
     fn gtk_css_provider_new() -> *mut c_void;
     fn gtk_css_provider_load_from_data(
@@ -105,6 +106,10 @@ button:hover {
     background-color: #293850;
     border-color: #38bdf8;
 }
+button:active {
+    background-color: #0284c7;
+    border-color: #7dd3fc;
+}
 #btn-start {
     background-color: #14532d;
     border-color: #22c55e;
@@ -122,11 +127,25 @@ button:hover {
 }
 ";
 
-use core::sync::atomic::{AtomicPtr, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering};
+use duplex_pal::monotonic_now_ns;
+use std::sync::Mutex;
 
 static TELEMETRY_LABEL_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static STATUS_LABEL_PTR: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 static WEB_PORT_LINUX: AtomicU16 = AtomicU16::new(48180);
+static LAST_BTN_ACTION_NS: AtomicU64 = AtomicU64::new(0);
+static LAST_TELEMETRY_MARKUP: Mutex<String> = Mutex::new(String::new());
+
+fn allow_button_action() -> bool {
+    let now = monotonic_now_ns();
+    let prev = LAST_BTN_ACTION_NS.load(Ordering::Acquire);
+    if now.saturating_sub(prev) < 250_000_000 {
+        return false;
+    }
+    LAST_BTN_ACTION_NS.store(now, Ordering::Release);
+    true
+}
 
 fn set_status_banner(msg: &str) {
     unsafe {
@@ -149,40 +168,66 @@ unsafe extern "C" fn on_window_destroy() {
 }
 
 unsafe extern "C" fn on_mode_idle(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = request_mode(OperationalMode::Mode0Idle);
     set_status_banner(&res.unwrap_or_else(|e| e));
+    on_telemetry_tick(ptr::null_mut());
 }
 
 unsafe extern "C" fn on_mode_pc_kvm(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = request_mode(OperationalMode::Mode1PcPrimary {
         extend_display: false,
     });
     set_status_banner(&res.unwrap_or_else(|e| e));
+    on_telemetry_tick(ptr::null_mut());
 }
 
 unsafe extern "C" fn on_mode_pc_extend(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = request_mode(OperationalMode::Mode1PcPrimary {
         extend_display: true,
     });
     set_status_banner(&res.unwrap_or_else(|e| e));
+    on_telemetry_tick(ptr::null_mut());
 }
 
 unsafe extern "C" fn on_mode_laptop(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = request_mode(OperationalMode::Mode2LaptopPrimary);
     set_status_banner(&res.unwrap_or_else(|e| e));
+    on_telemetry_tick(ptr::null_mut());
 }
 
 unsafe extern "C" fn on_start_daemon(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = start_local_daemon();
     set_status_banner(&res.unwrap_or_else(|e| e));
+    on_telemetry_tick(ptr::null_mut());
 }
 
 unsafe extern "C" fn on_setup_network(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = run_embedded_network_setup();
     set_status_banner(&res.unwrap_or_else(|e| e));
 }
 
 unsafe extern "C" fn on_open_web(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let port = WEB_PORT_LINUX.load(Ordering::Relaxed);
     let url = format!("http://127.0.0.1:{port}");
     open_url_in_browser(&url);
@@ -190,8 +235,12 @@ unsafe extern "C" fn on_open_web(_widget: *mut c_void, _data: *mut c_void) {
 }
 
 unsafe extern "C" fn on_panic(_widget: *mut c_void, _data: *mut c_void) {
+    if !allow_button_action() {
+        return;
+    }
     let res = trigger_panic_release();
     set_status_banner(&res.unwrap_or_else(|e| e));
+    on_telemetry_tick(ptr::null_mut());
 }
 
 unsafe extern "C" fn on_telemetry_tick(_data: *mut c_void) -> c_int {
@@ -220,8 +269,16 @@ unsafe extern "C" fn on_telemetry_tick(_data: *mut c_void) -> c_int {
             "OFF"
         };
 
-        let safe_mode_label = snap.mode_label.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
-        let safe_mode_sub = snap.mode_subtitle.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let safe_mode_label = snap
+            .mode_label
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        let safe_mode_sub = snap
+            .mode_subtitle
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
 
         let markup = format!(
             "<span size=\"large\" weight=\"bold\" foreground=\"#38bdf8\">{mode_label}</span>\n\
@@ -229,16 +286,14 @@ unsafe extern "C" fn on_telemetry_tick(_data: *mut c_void) -> c_int {
              <tt>Daemon Status       : </tt>{daemon_badge}\n\
              <tt>Peer 1GbE Link      : </tt>{peer_badge}\n\
              <tt>Input Grab &amp; Disp   : </tt>{grab_badge}  |  Virtual Displays: <b>{vdisp}</b>\n\
-             <tt>Heartbeat Age       : </tt>Daemon: <b>{d_age:.1} ms</b>  |  Peer: <b>{p_age:.1} ms</b>\n\
-             <tt>Link RTT (min/cur/max): </tt><b>{min_rtt:.1} µs</b> / <b>{cur_rtt:.1} µs</b> / <b>{max_rtt:.1} µs</b>\n\
+             <tt>Global Mode Hotkey  : </tt><b>Ctrl+Alt+P</b> (Cycle)  |  <b>Ctrl+Alt+0..3</b> (Direct)\n\
+             <tt>Link RTT (min/cur/max): </tt><b>{min_rtt:.0} µs</b> / <b>{cur_rtt:.0} µs</b> / <b>{max_rtt:.0} µs</b>\n\
              <tt>HID Batches (TX/RX) : </tt><b>{tx_hid}</b> / <b>{rx_hid}</b>  <span foreground=\"#94a3b8\">(UDP 48100 DSCP EF 0xB8)</span>\n\
              <tt>Video Frames (TX/RX): </tt><b>{tx_vid}</b> / <b>{rx_vid}</b>  <span foreground=\"#94a3b8\">(UDP 48102-3 DSCP AF41 0x88)</span>\n\
              <tt>PLI Keyframe Recover: </tt><b>{pli}</b>",
             mode_label = safe_mode_label,
             mode_sub = safe_mode_sub,
             vdisp = snap.virtual_displays_active,
-            d_age = snap.daemon_age_ms,
-            p_age = snap.peer_age_ms,
             min_rtt = snap.min_rtt_us,
             cur_rtt = snap.last_rtt_us,
             max_rtt = snap.max_rtt_us,
@@ -249,17 +304,52 @@ unsafe extern "C" fn on_telemetry_tick(_data: *mut c_void) -> c_int {
             pli = snap.pli_keyframes_requested,
         );
 
-        if let Ok(cstr) = CString::new(markup) {
-            gtk_label_set_markup(telemetry_label, cstr.as_ptr());
+        let should_update = if let Ok(mut prev) = LAST_TELEMETRY_MARKUP.lock() {
+            if *prev != markup {
+                *prev = markup.clone();
+                true
+            } else {
+                false
+            }
+        } else {
+            true
+        };
+
+        if should_update {
+            if let Ok(cstr) = CString::new(markup) {
+                gtk_label_set_markup(telemetry_label, cstr.as_ptr());
+            }
         }
     }
     1 // G_SOURCE_CONTINUE
 }
 
-unsafe fn connect_clicked(button: *mut c_void, callback: unsafe extern "C" fn(*mut c_void, *mut c_void)) {
-    let sig = CString::new("clicked").unwrap();
+/// Connects both `"pressed"` (fires immediately on mouse-down / touchpad tap so periodic label updates
+/// can never cancel a click in progress) and `"clicked"` (for keyboard Space/Enter activation),
+/// guarded by `allow_button_action()` 250ms debounce.
+unsafe fn connect_button_action(
+    button: *mut c_void,
+    callback: unsafe extern "C" fn(*mut c_void, *mut c_void),
+) {
     let cb_ptr: unsafe extern "C" fn() = core::mem::transmute(callback);
-    g_signal_connect_data(button, sig.as_ptr(), cb_ptr, ptr::null_mut(), ptr::null(), 0);
+    let sig_pressed = CString::new("pressed").unwrap();
+    g_signal_connect_data(
+        button,
+        sig_pressed.as_ptr(),
+        cb_ptr,
+        ptr::null_mut(),
+        ptr::null(),
+        0,
+    );
+    let sig_clicked = CString::new("clicked").unwrap();
+    g_signal_connect_data(
+        button,
+        sig_clicked.as_ptr(),
+        cb_ptr,
+        ptr::null_mut(),
+        ptr::null(),
+        0,
+    );
 }
 
 /// Attempts to launch the native GTK3 desktop window. Returns `false` if no Wayland/X11 display is available.
@@ -291,7 +381,7 @@ pub fn run_native_gtk_window(web_port: u16) -> bool {
         let win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
         let title = CString::new("Duplex-KVM — Graphical Control & Telemetry Center").unwrap();
         gtk_window_set_title(win, title.as_ptr());
-        gtk_window_set_default_size(win, 660, 560);
+        gtk_window_set_default_size(win, 680, 580);
         gtk_window_set_position(win, 1); // GTK_WIN_POS_CENTER
         gtk_container_set_border_width(win, 18);
 
@@ -312,71 +402,88 @@ pub fn run_native_gtk_window(web_port: u16) -> bool {
         let header_lbl = gtk_label_new(ptr::null());
         let header_markup = CString::new(
             "<span size=\"x-large\" weight=\"bold\">Duplex-KVM Control Center</span>\n\
-             <span foreground=\"#94a3b8\">1 Gbps Bidirectional Wired KVM, Virtual Display Streamer &amp; 250ms Watchdog</span>",
+             <span foreground=\"#94a3b8\">Shortcut: <b>Ctrl+Alt+P</b> to Cycle Modes  |  <b>Ctrl+Alt+0..3</b> Direct Mode Select</span>",
         )
         .unwrap();
         gtk_label_set_markup(header_lbl, header_markup.as_ptr());
         gtk_label_set_xalign(header_lbl, 0.0);
         gtk_box_pack_start(root_vbox, header_lbl, 0, 0, 2);
 
-        gtk_box_pack_start(root_vbox, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, 0, 4);
+        gtk_box_pack_start(
+            root_vbox,
+            gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+            0,
+            0,
+            4,
+        );
 
-        // Live Telemetry Panel
+        // Live Telemetry Panel (fixed minimum size prevents layout reallocation from interrupting button clicks)
         let telemetry_lbl = gtk_label_new(ptr::null());
         gtk_label_set_xalign(telemetry_lbl, 0.0);
+        gtk_widget_set_size_request(telemetry_lbl, 630, 210);
         gtk_box_pack_start(root_vbox, telemetry_lbl, 0, 0, 4);
 
-        gtk_box_pack_start(root_vbox, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, 0, 4);
+        gtk_box_pack_start(
+            root_vbox,
+            gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+            0,
+            0,
+            4,
+        );
 
         // Mode Switcher Buttons
         let btn_m0 = gtk_button_new_with_label(
-            CString::new("Mode 0 — Idle (Local Only + 1GbE Internet Passthrough)")
+            CString::new("Mode 0 — Idle (Local Only + 1GbE Passthrough)  [Ctrl+Alt+0]")
                 .unwrap()
                 .as_ptr(),
         );
-        connect_clicked(btn_m0, on_mode_idle);
+        connect_button_action(btn_m0, on_mode_idle);
         gtk_box_pack_start(root_vbox, btn_m0, 0, 1, 2);
 
         let btn_m1_kvm = gtk_button_new_with_label(
-            CString::new("Mode 1 — PC Primary (Laptop Controls Windows PC, KVM Input Only)")
+            CString::new("Mode 1 — PC Primary (Laptop Controls Windows PC, Input Only)  [Ctrl+Alt+1]")
                 .unwrap()
                 .as_ptr(),
         );
-        connect_clicked(btn_m1_kvm, on_mode_pc_kvm);
+        connect_button_action(btn_m1_kvm, on_mode_pc_kvm);
         gtk_box_pack_start(root_vbox, btn_m1_kvm, 0, 1, 2);
 
         let btn_m1_ext = gtk_button_new_with_label(
-            CString::new("Mode 1+ — PC Primary (Laptop Controls PC + Extend 1 Virtual Display)")
+            CString::new("Mode 1+ — PC Primary (Laptop Controls PC + Extend Display)  [Ctrl+Alt+2]")
                 .unwrap()
                 .as_ptr(),
         );
-        connect_clicked(btn_m1_ext, on_mode_pc_extend);
+        connect_button_action(btn_m1_ext, on_mode_pc_extend);
         gtk_box_pack_start(root_vbox, btn_m1_ext, 0, 1, 2);
 
         let btn_m2 = gtk_button_new_with_label(
-            CString::new("Mode 2 — Laptop Primary (Dock Windows Dual Monitors & Peripherals to Laptop)")
+            CString::new("Mode 2 — Laptop Primary (Dock Windows Dual Monitors to Laptop)  [Ctrl+Alt+3]")
                 .unwrap()
                 .as_ptr(),
         );
-        connect_clicked(btn_m2, on_mode_laptop);
+        connect_button_action(btn_m2, on_mode_laptop);
         gtk_box_pack_start(root_vbox, btn_m2, 0, 1, 2);
 
-        gtk_box_pack_start(root_vbox, gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, 0, 4);
+        gtk_box_pack_start(
+            root_vbox,
+            gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+            0,
+            0,
+            4,
+        );
 
         // Daemon, 1-Click Network Setup & Web UI Row
         let action_hbox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
-        let btn_start = gtk_button_new_with_label(
-            CString::new("Start Local Daemon").unwrap().as_ptr(),
-        );
+        let btn_start =
+            gtk_button_new_with_label(CString::new("Start Local Daemon").unwrap().as_ptr());
         let start_name = CString::new("btn-start").unwrap();
         gtk_widget_set_name(btn_start, start_name.as_ptr());
-        connect_clicked(btn_start, on_start_daemon);
+        connect_button_action(btn_start, on_start_daemon);
         gtk_box_pack_start(action_hbox, btn_start, 1, 1, 0);
 
-        let btn_setup = gtk_button_new_with_label(
-            CString::new("1-Click Setup Network").unwrap().as_ptr(),
-        );
-        connect_clicked(btn_setup, on_setup_network);
+        let btn_setup =
+            gtk_button_new_with_label(CString::new("1-Click Setup Network").unwrap().as_ptr());
+        connect_button_action(btn_setup, on_setup_network);
         gtk_box_pack_start(action_hbox, btn_setup, 1, 1, 0);
 
         let btn_web = gtk_button_new_with_label(
@@ -384,7 +491,7 @@ pub fn run_native_gtk_window(web_port: u16) -> bool {
                 .unwrap()
                 .as_ptr(),
         );
-        connect_clicked(btn_web, on_open_web);
+        connect_button_action(btn_web, on_open_web);
         gtk_box_pack_start(action_hbox, btn_web, 1, 1, 0);
 
         gtk_box_pack_start(root_vbox, action_hbox, 0, 1, 2);
@@ -397,7 +504,7 @@ pub fn run_native_gtk_window(web_port: u16) -> bool {
         );
         let panic_name = CString::new("btn-panic").unwrap();
         gtk_widget_set_name(btn_panic, panic_name.as_ptr());
-        connect_clicked(btn_panic, on_panic);
+        connect_button_action(btn_panic, on_panic);
         gtk_box_pack_start(root_vbox, btn_panic, 0, 1, 4);
 
         // Status feedback bar
@@ -410,10 +517,10 @@ pub fn run_native_gtk_window(web_port: u16) -> bool {
         WEB_PORT_LINUX.store(web_port, Ordering::Release);
 
         set_status_banner(&format!(
-            "Ready — Web UI also active at http://127.0.0.1:{web_port}"
+            "Ready — Press Ctrl+Alt+P anytime to cycle modes (Web UI: http://127.0.0.1:{web_port})"
         ));
         on_telemetry_tick(ptr::null_mut());
-        g_timeout_add(100, on_telemetry_tick, ptr::null_mut());
+        g_timeout_add(400, on_telemetry_tick, ptr::null_mut());
 
         gtk_widget_show_all(win);
         gtk_main();

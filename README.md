@@ -16,11 +16,12 @@ Everything (Graphical Control Center, `duplexd` Daemon, `duplex-guard` 250ms Dea
 ### Inside the Graphical Control Center:
 1. **1-Click Setup Network:** Click **"1-Click Setup Network"** on first run to automatically configure the `192.168.137.1/24` <-> `192.168.137.2/24` 1GbE subnet, Windows NAT internet passthrough, firewall rules, and Linux `udev` / Wi-Fi-safe (`route-metric 700`) NetworkManager settings.
 2. **Start Local Daemon:** Click **"Start Local Daemon"** to launch the built-in background daemon and 250ms Dead-Man's Switch watchdog directly from the same executable.
-3. **Switch Operational Modes with 1 Click:**
-   - **Mode 0 — Idle (Local Only + 1GbE Internet Passthrough)**
-   - **Mode 1 — PC Primary (Laptop Controls Windows PC, KVM Input Only)**
-   - **Mode 1+ — PC Primary (Laptop Controls PC + Extend 1 Virtual Display)**
-   - **Mode 2 — Laptop Primary (Dock Windows Dual Monitors & Peripherals to Laptop)**
+3. **Switch Operational Modes with 1 Click or Global Keyboard Shortcuts:**
+   - **`Ctrl + Alt + P`** *(or `Ctrl + Win/Super + P`)*: **Cycle to the Next Mode** (`Mode 0 -> Mode 1 -> Mode 1+ -> Mode 2 -> Mode 0`) — works globally on both Windows 11 and Debian Linux even when input is grabbed!
+   - **`Ctrl + Alt + 0`**: **Mode 0 — Idle** *(Local Only + 1GbE Internet Passthrough)*
+   - **`Ctrl + Alt + 1`**: **Mode 1 — PC Primary** *(Laptop Controls Windows PC, KVM Input + Two-Finger Trackpad Scroll)*
+   - **`Ctrl + Alt + 2`**: **Mode 1+ — PC Primary + Extended Display** *(Laptop Controls PC + Streams Extended Windows Display onto Laptop)*
+   - **`Ctrl + Alt + 3`**: **Mode 2 — Laptop Primary** *(Dock Windows Dual Monitors & Peripherals to Laptop)*
 4. **Emergency Panic Release:** Click **"EMERGENCY PANIC / UNGRAB ALL"** or press **`Ctrl + Alt + Shift + Backspace`** (or **`Escape` 5 times in 1.5s**) on your physical keyboard to immediately release all input grabs and virtual displays.
 
 ---

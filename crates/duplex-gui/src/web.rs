@@ -194,22 +194,22 @@ const INDEX_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
   <div class="section">
-    <h2>Switch Operational Mode</h2>
+    <h2>Switch Operational Mode &mdash; Shortcut: <span style="color:var(--accent)">Ctrl+Alt+P</span> (Cycle) | <span style="color:var(--accent)">Ctrl+Alt+0..3</span></h2>
     <div class="mode-buttons">
       <button id="btn-mode-0" onclick="setMode('idle')">
-        <span class="btn-title">Mode 0 &mdash; Idle (Local Only)</span>
+        <span class="btn-title">Mode 0 &mdash; Idle (Local Only) [Ctrl+Alt+0]</span>
         <span class="btn-desc">Release all input grabs &amp; virtual displays; keep 1GbE internet passthrough active.</span>
       </button>
       <button id="btn-mode-3" onclick="setMode('pc_kvm')">
-        <span class="btn-title">Mode 1 &mdash; PC Primary (KVM Input Only)</span>
+        <span class="btn-title">Mode 1 &mdash; PC Primary (KVM Input Only) [Ctrl+Alt+1]</span>
         <span class="btn-desc">Debian Laptop keyboard &amp; trackpad control the Windows 11 Desktop.</span>
       </button>
       <button id="btn-mode-1" onclick="setMode('pc_extend')">
-        <span class="btn-title">Mode 1+ &mdash; PC Primary (+ Extend Display)</span>
+        <span class="btn-title">Mode 1+ &mdash; PC Primary (+ Extend Display) [Ctrl+Alt+2]</span>
         <span class="btn-desc">Laptop controls Windows PC + extends 1 Windows virtual monitor onto Laptop screen.</span>
       </button>
       <button id="btn-mode-2" onclick="setMode('laptop')">
-        <span class="btn-title">Mode 2 &mdash; Dock PC Dual Monitors to Laptop</span>
+        <span class="btn-title">Mode 2 &mdash; Dock PC Dual Monitors to Laptop [Ctrl+Alt+3]</span>
         <span class="btn-desc">Windows USB keyboard/mouse &amp; 2 physical monitors dock to the Debian Laptop.</span>
       </button>
     </div>
@@ -252,6 +252,17 @@ function triggerPanic() { postAction('/api/panic'); }
 function startDaemon() { postAction('/api/start-daemon'); }
 function setupNetwork() { postAction('/api/setup-network'); }
 
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && (e.altKey || e.metaKey)) {
+    const k = e.key.toLowerCase();
+    if (k === 'p') { e.preventDefault(); setMode('cycle'); }
+    else if (k === '0') { e.preventDefault(); setMode('idle'); }
+    else if (k === '1') { e.preventDefault(); setMode('pc_kvm'); }
+    else if (k === '2') { e.preventDefault(); setMode('pc_extend'); }
+    else if (k === '3') { e.preventDefault(); setMode('laptop'); }
+  }
+});
+
 async function refreshStatus() {
   try {
     const res = await fetch('/api/status');
@@ -290,7 +301,7 @@ async function refreshStatus() {
     }
   } catch (_) {}
 }
-setInterval(refreshStatus, 100);
+setInterval(refreshStatus, 250);
 refreshStatus();
 </script>
 </body>
@@ -343,6 +354,10 @@ fn handle_http_client(mut stream: TcpStream) {
             .next()
             .unwrap_or("idle");
         let mode = match target {
+            "cycle" => {
+                let snap = TelemetrySnapshot::read_current();
+                OperationalMode::from_u8_lossy(snap.mode_code).cycle_next()
+            }
             "pc_kvm" => OperationalMode::Mode1PcPrimary {
                 extend_display: false,
             },

@@ -244,6 +244,84 @@ impl PanicDetector {
 
         None
     }
+
+    /// Evaluates whether the newly depressed key completes a global mode-switching shortcut:
+    /// - `Ctrl + Alt + P` (or `Ctrl + Win/Super + P`): Cycles `Mode 0 -> Mode 1 -> Mode 1+ -> Mode 2 -> Mode 0`
+    /// - `Ctrl + Alt + 0`: Jumps directly to `Mode 0 (Idle)`
+    /// - `Ctrl + Alt + 1`: Jumps directly to `Mode 1 (PC Primary KVM)`
+    /// - `Ctrl + Alt + 2`: Jumps directly to `Mode 1+ (PC Primary + Extend Display)`
+    /// - `Ctrl + Alt + 3`: Jumps directly to `Mode 2 (Laptop Primary + Dual Monitors)`
+    #[inline]
+    pub fn observe_mode_hotkey(&self, usage: u8, pressed: bool) -> Option<HotkeyAction> {
+        if !pressed {
+            return None;
+        }
+        let ctrl_held = self.depressed.is_pressed(HID_USAGE_LEFT_CTRL)
+            || self.depressed.is_pressed(HID_USAGE_RIGHT_CTRL);
+        let alt_held = self.depressed.is_pressed(HID_USAGE_LEFT_ALT)
+            || self.depressed.is_pressed(HID_USAGE_RIGHT_ALT);
+        let gui_held = self.depressed.is_pressed(HID_USAGE_LEFT_GUI)
+            || self.depressed.is_pressed(HID_USAGE_RIGHT_GUI);
+        let shift_held = self.depressed.is_pressed(HID_USAGE_LEFT_SHIFT)
+            || self.depressed.is_pressed(HID_USAGE_RIGHT_SHIFT);
+
+        if !ctrl_held || (!alt_held && !gui_held) || shift_held {
+            return None;
+        }
+
+        match usage {
+            0x13 => Some(HotkeyAction::CycleNextMode), // 'P'
+            0x27 => Some(HotkeyAction::SelectMode(crate::state::OperationalMode::Mode0Idle)), // '0'
+            0x1E => Some(HotkeyAction::SelectMode(
+                crate::state::OperationalMode::Mode1PcPrimary {
+                    extend_display: false,
+                },
+            )), // '1'
+            0x1F => Some(HotkeyAction::SelectMode(
+                crate::state::OperationalMode::Mode1PcPrimary {
+                    extend_display: true,
+                },
+            )), // '2'
+            0x20 => Some(HotkeyAction::SelectMode(
+                crate::state::OperationalMode::Mode2LaptopPrimary,
+            )), // '3'
+            _ => None,
+        }
+    }
+}
+
+/// Global keyboard shortcut action (`Ctrl+Alt+P` / `Ctrl+Win+P` / `Ctrl+Alt+0..3`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyAction {
+    CycleNextMode,
+    SelectMode(crate::state::OperationalMode),
+}
+
+impl HotkeyAction {
+    #[inline]
+    pub const fn resolve(
+        self,
+        current: crate::state::OperationalMode,
+    ) -> crate::state::OperationalMode {
+        use crate::state::OperationalMode;
+        match self {
+            Self::SelectMode(mode) => mode,
+            Self::CycleNextMode => match current {
+                OperationalMode::Mode0Idle => OperationalMode::Mode1PcPrimary {
+                    extend_display: false,
+                },
+                OperationalMode::Mode1PcPrimary {
+                    extend_display: false,
+                } => OperationalMode::Mode1PcPrimary {
+                    extend_display: true,
+                },
+                OperationalMode::Mode1PcPrimary {
+                    extend_display: true,
+                } => OperationalMode::Mode2LaptopPrimary,
+                OperationalMode::Mode2LaptopPrimary => OperationalMode::Mode0Idle,
+            },
+        }
+    }
 }
 
 #[cfg(test)]

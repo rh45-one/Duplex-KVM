@@ -87,6 +87,26 @@ impl OperationalMode {
         }
     }
 
+    /// Cycles to the next operational mode (`Mode 0 -> Mode 1 -> Mode 1+ -> Mode 2 -> Mode 0`),
+    /// used by the global `Ctrl+Alt+P` mode switcher shortcut.
+    #[inline]
+    pub const fn cycle_next(self) -> Self {
+        match self {
+            Self::Mode0Idle => Self::Mode1PcPrimary {
+                extend_display: false,
+            },
+            Self::Mode1PcPrimary {
+                extend_display: false,
+            } => Self::Mode1PcPrimary {
+                extend_display: true,
+            },
+            Self::Mode1PcPrimary {
+                extend_display: true,
+            } => Self::Mode2LaptopPrimary,
+            Self::Mode2LaptopPrimary => Self::Mode0Idle,
+        }
+    }
+
     /// Returns true if the given node role captures local physical input in this mode.
     #[inline]
     pub const fn should_capture_input(self, role: NodeRole) -> bool {

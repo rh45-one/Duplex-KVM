@@ -39,6 +39,8 @@ const BTN_MIDDLE: u16 = 0x112;
 const BTN_SIDE: u16 = 0x113;
 const BTN_EXTRA: u16 = 0x114;
 const BTN_TOUCH: u16 = 0x14A;
+const BTN_TOOL_DOUBLETAP: u16 = 0x14D;
+const BTN_TOOL_TRIPLETAP: u16 = 0x14E;
 
 // Linux ioctl encodings for evdev ('E' = 0x45) and uinput ('U' = 0x55)
 const EVIOCGID: libc::c_ulong = 0x8008_4502;
@@ -342,7 +344,9 @@ impl Drop for LinuxUinputInjector {
 /// capture and `/dev/uinput` kernel injection.
 pub struct LinuxInputBackend {
     epoll_fd: RawFd,
+    passive_epoll_fd: RawFd,
     grabbed_devices: Vec<GrabbedEvdevDevice>,
+    passive_fds: Vec<RawFd>,
     injector: Option<LinuxUinputInjector>,
     panic_detector: PanicDetector,
     shm: Option<Arc<crate::shm::ShmWatchdog>>,
@@ -351,8 +355,15 @@ pub struct LinuxInputBackend {
     rel_vwheel_accum: i16,
     rel_hwheel_accum: i16,
     touchpad_touch_active: bool,
+    touchpad_two_finger: bool,
     touchpad_last_x: Option<i32>,
     touchpad_last_y: Option<i32>,
+    touchpad_scroll_x_rem: i32,
+    touchpad_scroll_y_rem: i32,
+    touchpad_touch_start_ns: u64,
+    touchpad_tap_motion: i32,
+    touchpad_max_fingers: u8,
+    last_hotkey_ns: u64,
 }
 
 impl LinuxInputBackend {
@@ -364,6 +375,7 @@ impl LinuxInputBackend {
                 std::io::Error::last_os_error()
             )));
         }
+        let passive_epoll_fd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
 
         // Attempt to open /dev/uinput injector eagerly (or lazily if running unprivileged in unit tests)
         let injector = match LinuxUinputInjector::new(shm.clone()) {
@@ -374,9 +386,11 @@ impl LinuxInputBackend {
             }
         };
 
-        Ok(Self {
+        let mut backend = Self {
             epoll_fd,
+            passive_epoll_fd,
             grabbed_devices: Vec::new(),
+            passive_fds: Vec::new(),
             injector,
             panic_detector: PanicDetector::new(),
             shm,
@@ -385,9 +399,165 @@ impl LinuxInputBackend {
             rel_vwheel_accum: 0,
             rel_hwheel_accum: 0,
             touchpad_touch_active: false,
+            touchpad_two_finger: false,
             touchpad_last_x: None,
             touchpad_last_y: None,
-        })
+            touchpad_scroll_x_rem: 0,
+            touchpad_scroll_y_rem: 0,
+            touchpad_touch_start_ns: 0,
+            touchpad_tap_motion: 0,
+            touchpad_max_fingers: 0,
+            last_hotkey_ns: 0,
+        };
+        backend.open_passive_hotkey_listeners();
+        Ok(backend)
+    }
+
+    /// Opens physical keyboard `/dev/input/event*` devices in non-exclusive (`O_RDONLY | O_NONBLOCK`,
+    /// NO `EVIOCGRAB`) mode so global shortcuts (`Ctrl+Alt+P`, `Ctrl+Alt+0..3`) work even in `Mode 0 (Idle)`.
+    fn open_passive_hotkey_listeners(&mut self) {
+        self.close_passive_hotkey_listeners();
+        if self.passive_epoll_fd < 0 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir("/dev/input") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.starts_with("event") {
+                continue;
+            }
+            let path = format!("/dev/input/{name_str}");
+            if !Self::is_capturable_evdev_device(&path) {
+                continue;
+            }
+            let Ok(c_path) = CString::new(path.as_str()) else {
+                continue;
+            };
+            let fd = unsafe {
+                libc::open(
+                    c_path.as_ptr(),
+                    libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                let mut ev = libc::epoll_event {
+                    events: libc::EPOLLIN as u32,
+                    u64: fd as u64,
+                };
+                let rc = unsafe {
+                    libc::epoll_ctl(
+                        self.passive_epoll_fd,
+                        libc::EPOLL_CTL_ADD,
+                        fd,
+                        &mut ev as *mut libc::epoll_event,
+                    )
+                };
+                if rc == 0 {
+                    self.passive_fds.push(fd);
+                } else {
+                    unsafe {
+                        let _ = libc::close(fd);
+                    }
+                }
+            }
+        }
+    }
+
+    fn close_passive_hotkey_listeners(&mut self) {
+        for fd in self.passive_fds.drain(..) {
+            unsafe {
+                if self.passive_epoll_fd >= 0 {
+                    let _ = libc::epoll_ctl(
+                        self.passive_epoll_fd,
+                        libc::EPOLL_CTL_DEL,
+                        fd,
+                        core::ptr::null_mut(),
+                    );
+                }
+                let _ = libc::close(fd);
+            }
+        }
+    }
+
+    fn poll_passive_hotkeys(&mut self) {
+        if self.passive_epoll_fd < 0 || self.passive_fds.is_empty() {
+            return;
+        }
+        let mut epoll_events = [libc::epoll_event { events: 0, u64: 0 }; 16];
+        let ready = unsafe {
+            libc::epoll_wait(
+                self.passive_epoll_fd,
+                epoll_events.as_mut_ptr(),
+                epoll_events.len() as libc::c_int,
+                0,
+            )
+        };
+        if ready <= 0 {
+            return;
+        }
+        let now_ns = monotonic_now_ns();
+        let mut raw_buf = [libc::input_event {
+            time: libc::timeval {
+                tv_sec: 0,
+                tv_usec: 0,
+            },
+            type_: 0,
+            code: 0,
+            value: 0,
+        }; 32];
+
+        for item in epoll_events.iter().take(ready as usize) {
+            let fd = item.u64 as RawFd;
+            loop {
+                let bytes_read = unsafe {
+                    libc::read(
+                        fd,
+                        raw_buf.as_mut_ptr() as *mut libc::c_void,
+                        core::mem::size_of_val(&raw_buf),
+                    )
+                };
+                if bytes_read <= 0 {
+                    break;
+                }
+                let count = (bytes_read as usize) / core::mem::size_of::<libc::input_event>();
+                for ev in &raw_buf[..count] {
+                    if ev.type_ == EV_KEY && (ev.value == 0 || ev.value == 1) {
+                        let pressed = ev.value == 1;
+                        if let Some(usage) = linux_evdev_to_hid(ev.code) {
+                            let _ = self.panic_detector.observe_key(usage, pressed, now_ns);
+                            if let Some(hotkey) =
+                                self.panic_detector.observe_mode_hotkey(usage, pressed)
+                            {
+                                self.dispatch_hotkey_to_shm(hotkey, now_ns);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn dispatch_hotkey_to_shm(&mut self, hotkey: duplex_proto::HotkeyAction, now_ns: u64) {
+        if now_ns.saturating_sub(self.last_hotkey_ns) < 350_000_000 {
+            return;
+        }
+        self.last_hotkey_ns = now_ns;
+        if let Some(ref shm) = self.shm {
+            let block = shm.block();
+            let cur = OperationalMode::from_u8_lossy(block.active_mode.load(Ordering::Acquire));
+            let target = hotkey.resolve(cur);
+            info!(
+                from = ?cur,
+                to = ?target,
+                "Global keyboard shortcut (Ctrl+Alt+P / Ctrl+Alt+0..3) triggered mode switch"
+            );
+            block
+                .requested_mode
+                .store(target.as_u8(), Ordering::SeqCst);
+        }
     }
 
     /// Inspects an `/dev/input/event*` node to determine if it is a physical keyboard, mouse, or trackpad
@@ -453,15 +623,27 @@ impl LinuxInputBackend {
                 .store(OperationalMode::Mode0Idle.as_u8(), Ordering::SeqCst);
         }
     }
+
+    fn reset_touchpad_state(&mut self) {
+        self.touchpad_touch_active = false;
+        self.touchpad_two_finger = false;
+        self.touchpad_last_x = None;
+        self.touchpad_last_y = None;
+        self.touchpad_scroll_x_rem = 0;
+        self.touchpad_scroll_y_rem = 0;
+        self.touchpad_touch_start_ns = 0;
+        self.touchpad_tap_motion = 0;
+        self.touchpad_max_fingers = 0;
+    }
 }
 
 impl InputBackend for LinuxInputBackend {
     fn start_capture(&mut self) -> Result<(), PalError> {
+        self.close_passive_hotkey_listeners();
         self.stop_capture()?;
+        self.close_passive_hotkey_listeners();
         self.panic_detector.reset();
-        self.touchpad_touch_active = false;
-        self.touchpad_last_x = None;
-        self.touchpad_last_y = None;
+        self.reset_touchpad_state();
 
         let entries = fs::read_dir("/dev/input")
             .map_err(|e| PalError::Input(format!("Failed to read /dev/input: {e}")))?;
@@ -525,14 +707,13 @@ impl InputBackend for LinuxInputBackend {
             // `dev` drops here, immediately executing `ioctl(fd, EVIOCGRAB, 0)` and `close(fd)`.
         }
         self.panic_detector.reset();
-        self.touchpad_touch_active = false;
-        self.touchpad_last_x = None;
-        self.touchpad_last_y = None;
+        self.reset_touchpad_state();
         if let Some(ref shm) = self.shm {
             shm.block()
                 .input_grab_active
                 .store(false, Ordering::Release);
         }
+        self.open_passive_hotkey_listeners();
         Ok(())
     }
 
@@ -541,6 +722,7 @@ impl InputBackend for LinuxInputBackend {
         out: &mut Vec<CapturedInputEvent>,
     ) -> Result<usize, PalError> {
         if self.grabbed_devices.is_empty() {
+            self.poll_passive_hotkeys();
             return Ok(0);
         }
 
@@ -596,10 +778,62 @@ impl InputBackend for LinuxInputBackend {
                             let pressed = ev.value == 1;
 
                             if ev.code == BTN_TOUCH {
-                                self.touchpad_touch_active = pressed;
-                                if !pressed {
+                                if pressed {
+                                    self.touchpad_touch_active = true;
+                                    self.touchpad_touch_start_ns = now_ns;
+                                    self.touchpad_tap_motion = 0;
+                                    if self.touchpad_max_fingers == 0 {
+                                        self.touchpad_max_fingers = 1;
+                                    }
+                                } else {
+                                    // Check for tap-to-click (<180ms and <45 units of finger travel)
+                                    let dur_ns =
+                                        now_ns.saturating_sub(self.touchpad_touch_start_ns);
+                                    if self.touchpad_touch_active
+                                        && dur_ns <= 180_000_000
+                                        && self.touchpad_tap_motion < 45
+                                    {
+                                        let btn = if self.touchpad_max_fingers >= 2 {
+                                            HidMouseButton::Right
+                                        } else {
+                                            HidMouseButton::Left
+                                        };
+                                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                                            button: btn,
+                                            pressed: true,
+                                        }));
+                                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                                            button: btn,
+                                            pressed: false,
+                                        }));
+                                        pushed += 2;
+                                    }
+                                    self.touchpad_touch_active = false;
                                     self.touchpad_last_x = None;
                                     self.touchpad_last_y = None;
+                                    self.touchpad_scroll_x_rem = 0;
+                                    self.touchpad_scroll_y_rem = 0;
+                                    self.touchpad_max_fingers = 0;
+                                }
+                                continue;
+                            }
+
+                            if ev.code == BTN_TOOL_DOUBLETAP {
+                                self.touchpad_two_finger = pressed;
+                                // Reset reference coordinates when switching between 1-finger and 2-finger
+                                self.touchpad_last_x = None;
+                                self.touchpad_last_y = None;
+                                self.touchpad_scroll_x_rem = 0;
+                                self.touchpad_scroll_y_rem = 0;
+                                if pressed {
+                                    self.touchpad_max_fingers = self.touchpad_max_fingers.max(2);
+                                }
+                                continue;
+                            }
+
+                            if ev.code == BTN_TOOL_TRIPLETAP {
+                                if pressed {
+                                    self.touchpad_max_fingers = self.touchpad_max_fingers.max(3);
                                 }
                                 continue;
                             }
@@ -638,6 +872,18 @@ impl InputBackend for LinuxInputBackend {
                                     return Ok(pushed + 2);
                                 }
 
+                                // Evaluate Global Mode-Switching Hotkeys (Ctrl+Alt+P / Ctrl+Alt+0..3)
+                                if let Some(hotkey) =
+                                    self.panic_detector.observe_mode_hotkey(usage, pressed)
+                                {
+                                    out.push(CapturedInputEvent::Hid(
+                                        HidEvent::ReleaseAllModifiers,
+                                    ));
+                                    pushed += 1;
+                                    self.dispatch_hotkey_to_shm(hotkey, now_ns);
+                                    continue;
+                                }
+
                                 out.push(CapturedInputEvent::Hid(HidEvent::Key { usage, pressed }));
                                 pushed += 1;
                             }
@@ -663,23 +909,58 @@ impl InputBackend for LinuxInputBackend {
                         },
                         EV_ABS => match ev.code {
                             ABS_X => {
-                                if self.touchpad_touch_active {
+                                if self.touchpad_touch_active || self.touchpad_two_finger {
                                     if let Some(prev_x) = self.touchpad_last_x {
-                                        let delta = ((ev.value - prev_x) / 2)
-                                            .clamp(i16::MIN as i32, i16::MAX as i32)
-                                            as i16;
-                                        self.rel_dx_accum = self.rel_dx_accum.saturating_add(delta);
+                                        let raw_dx = ev.value - prev_x;
+                                        self.touchpad_tap_motion =
+                                            self.touchpad_tap_motion.saturating_add(raw_dx.abs());
+                                        if self.touchpad_two_finger {
+                                            self.touchpad_scroll_x_rem =
+                                                self.touchpad_scroll_x_rem.saturating_add(raw_dx);
+                                            let ticks = (self.touchpad_scroll_x_rem / 32)
+                                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                                as i16;
+                                            if ticks != 0 {
+                                                self.rel_hwheel_accum =
+                                                    self.rel_hwheel_accum.saturating_sub(ticks);
+                                                self.touchpad_scroll_x_rem %= 32;
+                                            }
+                                        } else {
+                                            let delta = (raw_dx / 2)
+                                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                                as i16;
+                                            self.rel_dx_accum =
+                                                self.rel_dx_accum.saturating_add(delta);
+                                        }
                                     }
                                     self.touchpad_last_x = Some(ev.value);
                                 }
                             }
                             ABS_Y => {
-                                if self.touchpad_touch_active {
+                                if self.touchpad_touch_active || self.touchpad_two_finger {
                                     if let Some(prev_y) = self.touchpad_last_y {
-                                        let delta = ((ev.value - prev_y) / 2)
-                                            .clamp(i16::MIN as i32, i16::MAX as i32)
-                                            as i16;
-                                        self.rel_dy_accum = self.rel_dy_accum.saturating_add(delta);
+                                        let raw_dy = ev.value - prev_y;
+                                        self.touchpad_tap_motion =
+                                            self.touchpad_tap_motion.saturating_add(raw_dy.abs());
+                                        if self.touchpad_two_finger {
+                                            self.touchpad_scroll_y_rem =
+                                                self.touchpad_scroll_y_rem.saturating_add(raw_dy);
+                                            let ticks = (self.touchpad_scroll_y_rem / 28)
+                                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                                as i16;
+                                            if ticks != 0 {
+                                                // Natural two-finger scrolling: moving fingers up (raw_dy < 0) scrolls down (negative wheel)
+                                                self.rel_vwheel_accum =
+                                                    self.rel_vwheel_accum.saturating_add(ticks);
+                                                self.touchpad_scroll_y_rem %= 28;
+                                            }
+                                        } else {
+                                            let delta = (raw_dy / 2)
+                                                .clamp(i16::MIN as i32, i16::MAX as i32)
+                                                as i16;
+                                            self.rel_dy_accum =
+                                                self.rel_dy_accum.saturating_add(delta);
+                                        }
                                     }
                                     self.touchpad_last_y = Some(ev.value);
                                 }
@@ -748,9 +1029,13 @@ impl InputBackend for LinuxInputBackend {
 impl Drop for LinuxInputBackend {
     fn drop(&mut self) {
         let _ = self.stop_capture();
+        self.close_passive_hotkey_listeners();
         let _ = self.release_all_stuck_keys();
         unsafe {
             let _ = libc::close(self.epoll_fd);
+            if self.passive_epoll_fd >= 0 {
+                let _ = libc::close(self.passive_epoll_fd);
+            }
         }
     }
 }

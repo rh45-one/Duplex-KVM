@@ -289,6 +289,164 @@ impl VideoFrameAssembler {
     }
 }
 
+/// Magic header `"DPXB"` for built-in zero-dependency low-latency RLE RGB565 horizontal screen bands.
+pub const DPXB_BAND_MAGIC: [u8; 4] = *b"DPXB";
+
+/// Encodes a `frame_w x frame_h` `BGRx` (`4 bytes/pixel`) screen capture frame into changed horizontal
+/// `DPXB` RLE-compressed bands (`EncodedVideoFrame` units) for zero-dependency cross-OS streaming.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_bgrx_frame_to_bands(
+    monitor_index: u8,
+    frame_w: u16,
+    frame_h: u16,
+    bgrx: &[u8],
+    prev_rgb565: &mut Vec<u16>,
+    force_keyframe: bool,
+    cycle_counter: u32,
+    frame_seq: &mut u32,
+    now_ns: u64,
+    out_frames: &mut Vec<EncodedVideoFrame>,
+) {
+    let total_pixels = (frame_w as usize) * (frame_h as usize);
+    if bgrx.len() < total_pixels * 4 || frame_w == 0 || frame_h == 0 {
+        return;
+    }
+
+    let is_first = prev_rgb565.len() != total_pixels;
+    if is_first {
+        prev_rgb565.clear();
+        prev_rgb565.resize(total_pixels, 0);
+    }
+
+    let band_lines: u16 = 18;
+    let num_bands = frame_h.div_ceil(band_lines);
+
+    for band_idx in 0..num_bands {
+        let band_y = band_idx * band_lines;
+        let band_h = band_lines.min(frame_h.saturating_sub(band_y));
+        if band_h == 0 {
+            continue;
+        }
+
+        let start_px = (band_y as usize) * (frame_w as usize);
+        let band_px_count = (band_h as usize) * (frame_w as usize);
+        let end_px = start_px + band_px_count;
+
+        let mut band_changed =
+            is_first || force_keyframe || ((u32::from(band_idx) + cycle_counter) % u32::from(num_bands) == 0);
+
+        // Convert BGRx -> RGB565 and check whether this horizontal band changed
+        for px_idx in start_px..end_px {
+            let off = px_idx * 4;
+            let b = u16::from(bgrx[off]);
+            let g = u16::from(bgrx[off + 1]);
+            let r = u16::from(bgrx[off + 2]);
+            let rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+            if prev_rgb565[px_idx] != rgb565 {
+                prev_rgb565[px_idx] = rgb565;
+                band_changed = true;
+            }
+        }
+
+        if !band_changed {
+            continue;
+        }
+
+        // Encode 12-byte DPXB band header + 3-byte RLE runs: [run_len: u8, color_hi: u8, color_lo: u8]
+        let mut payload = Vec::with_capacity(12 + band_px_count);
+        payload.extend_from_slice(&DPXB_BAND_MAGIC);
+        payload.extend_from_slice(&frame_w.to_be_bytes());
+        payload.extend_from_slice(&frame_h.to_be_bytes());
+        payload.extend_from_slice(&band_y.to_be_bytes());
+        payload.extend_from_slice(&band_h.to_be_bytes());
+
+        let slice = &prev_rgb565[start_px..end_px];
+        let mut i = 0usize;
+        while i < slice.len() {
+            let color = slice[i];
+            let mut run = 1usize;
+            while i + run < slice.len() && slice[i + run] == color && run < 255 {
+                run += 1;
+            }
+            payload.push(run as u8);
+            payload.extend_from_slice(&color.to_be_bytes());
+            i += run;
+        }
+
+        let seq = *frame_seq;
+        *frame_seq = frame_seq.wrapping_add(1);
+        out_frames.push(EncodedVideoFrame {
+            monitor_index,
+            codec: VideoCodec::Hevc,
+            is_keyframe: force_keyframe && band_idx == 0,
+            frame_seq: seq,
+            capture_timestamp_ns: now_ns,
+            data: payload,
+        });
+    }
+}
+
+/// Decodes a `DPXB` RLE-compressed band payload directly into a `BGRx` (`4 bytes/pixel`) canvas buffer.
+/// Returns `true` if a valid band was decoded and applied.
+pub fn decode_band_into_bgrx(
+    data: &[u8],
+    canvas_w: &mut u16,
+    canvas_h: &mut u16,
+    canvas_bgrx: &mut Vec<u8>,
+) -> bool {
+    if data.len() < 12 || data[0..4] != DPXB_BAND_MAGIC {
+        return false;
+    }
+
+    let fw = u16::from_be_bytes([data[4], data[5]]);
+    let fh = u16::from_be_bytes([data[6], data[7]]);
+    let by = u16::from_be_bytes([data[8], data[9]]);
+    let bh = u16::from_be_bytes([data[10], data[11]]);
+
+    if fw == 0 || fh == 0 || by >= fh || bh == 0 {
+        return false;
+    }
+
+    let total_bytes = (fw as usize) * (fh as usize) * 4;
+    if *canvas_w != fw || *canvas_h != fh || canvas_bgrx.len() != total_bytes {
+        *canvas_w = fw;
+        *canvas_h = fh;
+        canvas_bgrx.clear();
+        canvas_bgrx.resize(total_bytes, 0);
+    }
+
+    let start_px = (by as usize) * (fw as usize);
+    let max_px = ((fw as usize) * (fh as usize)).min(start_px + (bh as usize) * (fw as usize));
+    let mut px_idx = start_px;
+    let mut pos = 12usize;
+
+    while pos + 3 <= data.len() && px_idx < max_px {
+        let run = data[pos] as usize;
+        let color = u16::from_be_bytes([data[pos + 1], data[pos + 2]]);
+        pos += 3;
+
+        let r5 = ((color >> 11) & 0x1F) as u8;
+        let g6 = ((color >> 5) & 0x3F) as u8;
+        let b5 = (color & 0x1F) as u8;
+
+        let r = (r5 << 3) | (r5 >> 2);
+        let g = (g6 << 2) | (g6 >> 4);
+        let b = (b5 << 3) | (b5 >> 2);
+
+        let end = (px_idx + run).min(max_px);
+        while px_idx < end {
+            let off = px_idx * 4;
+            canvas_bgrx[off] = b;
+            canvas_bgrx[off + 1] = g;
+            canvas_bgrx[off + 2] = r;
+            canvas_bgrx[off + 3] = 0xFF;
+            px_idx += 1;
+        }
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,5 +472,33 @@ mod tests {
         let (completed, gap) = assembler.push_datagram(&dgrams[2]).unwrap();
         assert!(!gap);
         assert_eq!(completed.unwrap(), original);
+    }
+
+    #[test]
+    fn test_dpxb_band_encode_decode_roundtrip() {
+        let w = 64u16;
+        let h = 36u16;
+        let mut src_bgrx = vec![0u8; (w as usize) * (h as usize) * 4];
+        for i in 0..(w as usize * h as usize) {
+            src_bgrx[i * 4] = 0x40; // B
+            src_bgrx[i * 4 + 1] = 0x80; // G
+            src_bgrx[i * 4 + 2] = 0xF8; // R
+            src_bgrx[i * 4 + 3] = 0xFF;
+        }
+        let mut prev = Vec::new();
+        let mut seq = 0u32;
+        let mut bands = Vec::new();
+        encode_bgrx_frame_to_bands(0, w, h, &src_bgrx, &mut prev, true, 0, &mut seq, 100, &mut bands);
+        assert_eq!(bands.len(), 2);
+
+        let mut dst_w = 0u16;
+        let mut dst_h = 0u16;
+        let mut dst_bgrx = Vec::new();
+        for b in &bands {
+            assert!(decode_band_into_bgrx(&b.data, &mut dst_w, &mut dst_h, &mut dst_bgrx));
+        }
+        assert_eq!(dst_w, w);
+        assert_eq!(dst_h, h);
+        assert_eq!(dst_bgrx.len(), src_bgrx.len());
     }
 }

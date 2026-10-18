@@ -9,10 +9,10 @@ use crate::shm::monotonic_now_ns;
 use crate::{CapturedInputEvent, InputBackend, PalError};
 use core::cell::UnsafeCell;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use duplex_proto::{
     hid_to_windows_scancode, windows_scancode_to_hid, DepressedKeyBitmap, HidEvent, HidMouseButton,
-    OperationalMode, PanicDetector, ALL_HID_MODIFIER_USAGES,
+    HotkeyAction, OperationalMode, PanicDetector, ALL_HID_MODIFIER_USAGES,
 };
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
+    GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
     MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_WHEEL,
@@ -53,6 +53,9 @@ static WIN_INPUT_RING: SpscRingBuffer<CapturedInputEvent, 4096> = SpscRingBuffer
 static WIN_CAPTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// Atomic flag latched when the hardware panic sequence trips inside `LowLevelKeyboardProc`.
 static WIN_PANIC_LATCHED: AtomicBool = AtomicBool::new(false);
+/// Atomic code latched when a mode hotkey (`Ctrl+Alt+P` or `Ctrl+Alt+0..3`) is pressed inside `LowLevelKeyboardProc`.
+/// `0` = none, `10` = `CycleNextMode`, `100 + mode_code` = `SelectMode`.
+static WIN_HOTKEY_LATCHED: AtomicU8 = AtomicU8::new(0);
 /// Thread ID of the dedicated Win32 hook message pump thread.
 static WIN_HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 
@@ -99,6 +102,19 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
                 }
                 return CallNextHookEx(HHOOK::default(), n_code, w_param, l_param);
+            }
+
+            // Check Global Mode-Switching Hotkeys (`Ctrl+Alt+P` / `Ctrl+Alt+0..3`)
+            if let Some(hotkey) = detector.observe_mode_hotkey(usage, pressed) {
+                let code = match hotkey {
+                    HotkeyAction::CycleNextMode => 10u8,
+                    HotkeyAction::SelectMode(m) => 100u8 + m.as_u8(),
+                };
+                WIN_HOTKEY_LATCHED.store(code, Ordering::Release);
+                let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(
+                    HidEvent::ReleaseAllModifiers,
+                ));
+                return LRESULT(1);
             }
 
             let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(HidEvent::Key {
@@ -197,6 +213,8 @@ pub struct WindowsInputBackend {
     hook_thread: Option<JoinHandle<()>>,
     depressed: DepressedKeyBitmap,
     shm: Option<Arc<crate::shm::ShmWatchdog>>,
+    last_hotkey_ns: u64,
+    passive_hotkey_held: bool,
 }
 
 impl WindowsInputBackend {
@@ -205,7 +223,88 @@ impl WindowsInputBackend {
             hook_thread: None,
             depressed: DepressedKeyBitmap::new(),
             shm,
+            last_hotkey_ns: 0,
+            passive_hotkey_held: false,
         })
+    }
+
+    fn dispatch_hotkey_to_shm(&mut self, action: HotkeyAction) {
+        let now_ns = monotonic_now_ns();
+        if now_ns.saturating_sub(self.last_hotkey_ns) < 350_000_000 {
+            return;
+        }
+        self.last_hotkey_ns = now_ns;
+        if let Some(ref shm) = self.shm {
+            let block = shm.block();
+            let target = match action {
+                HotkeyAction::CycleNextMode => {
+                    let cur =
+                        OperationalMode::from_u8_lossy(block.active_mode.load(Ordering::Acquire));
+                    cur.cycle_next()
+                }
+                HotkeyAction::SelectMode(m) => m,
+            };
+            info!(
+                ?action,
+                ?target,
+                "Global keyboard shortcut triggered on Windows (Ctrl+Alt+P / Ctrl+Alt+0..3)"
+            );
+            block
+                .requested_mode
+                .store(target.as_u8(), Ordering::Release);
+        }
+    }
+
+    fn poll_passive_hotkeys(&mut self) {
+        unsafe {
+            let ctrl = (GetAsyncKeyState(0x11) as u16 & 0x8000) != 0; // VK_CONTROL
+            let alt = (GetAsyncKeyState(0x12) as u16 & 0x8000) != 0; // VK_MENU
+            let lwin = (GetAsyncKeyState(0x5B) as u16 & 0x8000) != 0; // VK_LWIN
+            let rwin = (GetAsyncKeyState(0x5C) as u16 & 0x8000) != 0; // VK_RWIN
+
+            if !ctrl || !(alt || lwin || rwin) {
+                self.passive_hotkey_held = false;
+                return;
+            }
+
+            let p_down = (GetAsyncKeyState(0x50) as u16 & 0x8000) != 0; // 'P'
+            let k0_down = (GetAsyncKeyState(0x30) as u16 & 0x8000) != 0; // '0'
+            let k1_down = (GetAsyncKeyState(0x31) as u16 & 0x8000) != 0; // '1'
+            let k2_down = (GetAsyncKeyState(0x32) as u16 & 0x8000) != 0; // '2'
+            let k3_down = (GetAsyncKeyState(0x33) as u16 & 0x8000) != 0; // '3'
+
+            let any_action_key = p_down || k0_down || k1_down || k2_down || k3_down;
+            if !any_action_key {
+                self.passive_hotkey_held = false;
+                return;
+            }
+            if self.passive_hotkey_held {
+                return;
+            }
+            self.passive_hotkey_held = true;
+
+            if p_down {
+                self.dispatch_hotkey_to_shm(HotkeyAction::CycleNextMode);
+            } else if k0_down {
+                self.dispatch_hotkey_to_shm(HotkeyAction::SelectMode(OperationalMode::Mode0Idle));
+            } else if k1_down {
+                self.dispatch_hotkey_to_shm(HotkeyAction::SelectMode(
+                    OperationalMode::Mode1PcPrimary {
+                        extend_display: false,
+                    },
+                ));
+            } else if k2_down {
+                self.dispatch_hotkey_to_shm(HotkeyAction::SelectMode(
+                    OperationalMode::Mode1PcPrimary {
+                        extend_display: true,
+                    },
+                ));
+            } else if k3_down {
+                self.dispatch_hotkey_to_shm(HotkeyAction::SelectMode(
+                    OperationalMode::Mode2LaptopPrimary,
+                ));
+            }
+        }
     }
 
     fn build_scancode_input(scancode: u16, is_extended: bool, pressed: bool) -> INPUT {
@@ -360,6 +459,16 @@ impl InputBackend for WindowsInputBackend {
         out: &mut Vec<CapturedInputEvent>,
     ) -> Result<usize, PalError> {
         let count = WIN_INPUT_RING.drain_into(out, 256);
+        let hotkey_code = WIN_HOTKEY_LATCHED.swap(0, Ordering::AcqRel);
+        if hotkey_code == 10 {
+            self.dispatch_hotkey_to_shm(HotkeyAction::CycleNextMode);
+        } else if hotkey_code >= 100 {
+            let m = OperationalMode::from_u8_lossy(hotkey_code - 100);
+            self.dispatch_hotkey_to_shm(HotkeyAction::SelectMode(m));
+        }
+        if !WIN_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
+            self.poll_passive_hotkeys();
+        }
         if WIN_PANIC_LATCHED.swap(false, Ordering::AcqRel) {
             warn!("HARDWARE PANIC ESCAPE HATCH TRIPPED ON WINDOWS HOOK");
             self.emergency_panic_release()?;
