@@ -1,0 +1,2 @@
+7e6eb85fa4d932becb65df0fa1e1c5e5c634ddecf343157c616aa5f4a7ff1810  duplex-kvm-linux-x86_64
+87cf7e6eb4db577e59f785b4f555bd5e12b9be7eb322d94d5daeaa88c820d552  duplex-kvm-windows-x86_64.exe

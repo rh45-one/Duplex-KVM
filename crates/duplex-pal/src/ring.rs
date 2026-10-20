@@ -92,6 +92,12 @@ impl<T: Copy, const N: usize> SpscRingBuffer<T, N> {
     }
 }
 
+impl<T: Copy, const N: usize> Default for SpscRingBuffer<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

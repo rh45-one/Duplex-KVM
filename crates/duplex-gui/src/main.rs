@@ -5,18 +5,22 @@
 //! this single standalone executable:
 //! - **Double-click / run with no arguments**: Launches the Native Desktop Graphical Control Center
 //!   (GTK+ 3 on Linux Wayland/X11, Win32 on Windows 11) + background Web UI (`http://127.0.0.1:48180`).
-//! - **`--daemon` / `daemon`**: Runs the symmetric KVM, Virtual Display & HEVC Video daemon (`duplexd`).
+//! - **`--daemon` / `daemon`**: Runs the symmetric KVM, virtual display & screen streaming daemon (`duplexd`).
 //! - **`--guard` / `guard`**: Runs the 250ms Dead-Man's Switch hardware watchdog (`duplex-guard`).
 //! - **`--setup` / `setup`**: Executes the embedded OS network & permissions setup script.
 //! - **`status` | `watch` | `mode` | `panic`**: Operator CLI subcommands.
 
 pub mod design;
+mod diagnostics;
+pub mod updater;
 pub mod web;
 
 #[cfg(target_os = "linux")]
 pub mod linux_gtk;
 #[cfg(target_os = "windows")]
 pub mod win32_gui;
+#[cfg(target_os = "windows")]
+mod windows_setup;
 
 use core::sync::atomic::Ordering;
 use duplex_pal::{is_process_alive, monotonic_now_ns, ShmWatchdog};
@@ -30,6 +34,28 @@ use std::time::Duration;
 const EMBEDDED_WINDOWS_SETUP_PS1: &str =
     include_str!("../../../scripts/windows-setup-passthrough.ps1");
 const EMBEDDED_DEBIAN_SETUP_SH: &str = include_str!("../../../scripts/debian-setup-link.sh");
+
+/// Mode register used only in demo mode (`DUPLEX_UI_DEMO`), so UI previews never write to the
+/// real shared-memory block.
+static DEMO_MODE_CODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(1);
+
+/// `DUPLEX_UI_DEMO` value, read once: `1` / `online` (linked), `standby` (peer down), `offline`.
+fn demo_variant() -> Option<&'static str> {
+    static VARIANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    VARIANT
+        .get_or_init(|| {
+            env::var("DUPLEX_UI_DEMO")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .filter(|v| !v.is_empty() && v != "0")
+        })
+        .as_deref()
+}
+
+/// `true` when the UI runs on synthetic telemetry (`DUPLEX_UI_DEMO=1|standby|offline`).
+pub fn demo_mode_enabled() -> bool {
+    demo_variant().is_some()
+}
 
 #[derive(Debug, Clone)]
 pub struct TelemetrySnapshot {
@@ -59,7 +85,7 @@ impl TelemetrySnapshot {
         match mode {
             OperationalMode::Mode0Idle => (
                 "MODE 0: IDLE (LOCAL ONLY)",
-                "Local peripherals and displays independent; 1GbE internet passthrough active",
+                "Local peripherals and displays independent; internet sharing uses the network configuration",
             ),
             OperationalMode::Mode1PcPrimary {
                 extend_display: false,
@@ -80,7 +106,87 @@ impl TelemetrySnapshot {
         }
     }
 
+    /// Synthetic, gently fluctuating telemetry used when `DUPLEX_UI_DEMO=1` is set. Lets every
+    /// front-end be previewed and screenshotted without touching the real shared-memory block.
+    pub fn demo() -> Self {
+        let mode = OperationalMode::from_u8_lossy(DEMO_MODE_CODE.load(Ordering::Relaxed));
+        let (mode_label, mode_subtitle) = Self::describe_mode(mode);
+        let variant = demo_variant().unwrap_or("1");
+        if variant == "offline" {
+            return Self::offline();
+        }
+        let linked = variant != "standby";
+        let t = monotonic_now_ns() as f64 / 1_000_000_000.0;
+        let wobble = (t * 1.7).sin() * 0.5 + (t * 0.43).sin() * 0.5;
+        let last_rtt_us = 182.0 + wobble * 46.0 + ((t * 9.1).sin() * 9.0);
+        let ticks = (t * 125.0) as u64;
+        let active = linked && !matches!(mode, OperationalMode::Mode0Idle);
+        Self {
+            daemon_online: true,
+            daemon_pid: 4211,
+            mode,
+            mode_code: mode.as_u8(),
+            mode_label,
+            mode_subtitle,
+            peer_connected: linked,
+            input_grab_active: active,
+            virtual_displays_active: match (linked, mode) {
+                (
+                    true,
+                    OperationalMode::Mode1PcPrimary {
+                        extend_display: true,
+                    },
+                ) => 1,
+                (true, OperationalMode::Mode2LaptopPrimary) => 2,
+                _ => 0,
+            },
+            daemon_age_ms: 2.0 + (t * 3.3).sin().abs() * 6.0,
+            peer_age_ms: if linked {
+                9.0 + (t * 2.1).sin().abs() * 24.0
+            } else {
+                0.0
+            },
+            min_rtt_us: if linked { 121.0 } else { 0.0 },
+            last_rtt_us: if linked { last_rtt_us } else { 0.0 },
+            max_rtt_us: if linked { 418.0 } else { 0.0 },
+            tx_hid_packets: 120_034 + if linked { ticks } else { 0 },
+            rx_hid_packets: 118_902 + if linked { ticks / 2 } else { 0 },
+            tx_video_frames: if active { 48_311 + ticks / 2 } else { 48_311 },
+            rx_video_frames: 47_990,
+            pli_keyframes_requested: 3,
+        }
+    }
+
+    /// Snapshot reported when no daemon shared-memory block is available.
+    pub fn offline() -> Self {
+        let (mode_label, mode_subtitle) = Self::describe_mode(OperationalMode::Mode0Idle);
+        Self {
+            daemon_online: false,
+            daemon_pid: 0,
+            mode: OperationalMode::Mode0Idle,
+            mode_code: 0,
+            mode_label,
+            mode_subtitle,
+            peer_connected: false,
+            input_grab_active: false,
+            virtual_displays_active: 0,
+            daemon_age_ms: 0.0,
+            peer_age_ms: 0.0,
+            min_rtt_us: 0.0,
+            last_rtt_us: 0.0,
+            max_rtt_us: 0.0,
+            tx_hid_packets: 0,
+            rx_hid_packets: 0,
+            tx_video_frames: 0,
+            rx_video_frames: 0,
+            pli_keyframes_requested: 0,
+        }
+    }
+
     pub fn read_current() -> Self {
+        if demo_mode_enabled() {
+            return Self::demo();
+        }
         if let Ok(shm) = ShmWatchdog::open(false) {
             let block = shm.block();
             if block.is_valid() {
@@ -136,28 +242,7 @@ impl TelemetrySnapshot {
             }
         }
 
-        let (mode_label, mode_subtitle) = Self::describe_mode(OperationalMode::Mode0Idle);
-        Self {
-            daemon_online: false,
-            daemon_pid: 0,
-            mode: OperationalMode::Mode0Idle,
-            mode_code: 0,
-            mode_label,
-            mode_subtitle,
-            peer_connected: false,
-            input_grab_active: false,
-            virtual_displays_active: 0,
-            daemon_age_ms: 0.0,
-            peer_age_ms: 0.0,
-            min_rtt_us: 0.0,
-            last_rtt_us: 0.0,
-            max_rtt_us: 0.0,
-            tx_hid_packets: 0,
-            rx_hid_packets: 0,
-            tx_video_frames: 0,
-            rx_video_frames: 0,
-            pli_keyframes_requested: 0,
-        }
+        Self::offline()
     }
 
     pub fn to_json(&self) -> String {
@@ -191,14 +276,28 @@ impl TelemetrySnapshot {
 }
 
 pub fn request_mode(target: OperationalMode) -> Result<String, String> {
+    if demo_mode_enabled() {
+        if demo_variant() == Some("offline") {
+            return Err("[DEMO] Daemon is not running — start the local daemon first".to_string());
+        }
+        DEMO_MODE_CODE.store(target.as_u8(), Ordering::Relaxed);
+        let (lbl, _) = TelemetrySnapshot::describe_mode(target);
+        return Ok(format!("[DEMO] Requested transition -> {lbl}"));
+    }
+
     if !TelemetrySnapshot::read_current().daemon_online {
-        let _ = start_local_daemon();
+        start_local_daemon()?;
         for _ in 0..12 {
             thread::sleep(Duration::from_millis(50));
             if TelemetrySnapshot::read_current().daemon_online {
                 break;
             }
         }
+    }
+
+    let snapshot = TelemetrySnapshot::read_current();
+    if target != OperationalMode::Mode0Idle && !snapshot.peer_connected {
+        return Err(diagnostics::link_status(&snapshot).message);
     }
 
     match ShmWatchdog::open(false) {
@@ -219,6 +318,10 @@ pub fn request_mode(target: OperationalMode) -> Result<String, String> {
 }
 
 pub fn trigger_panic_release() -> Result<String, String> {
+    if demo_mode_enabled() {
+        DEMO_MODE_CODE.store(OperationalMode::Mode0Idle.as_u8(), Ordering::Relaxed);
+        return Ok("[DEMO] Emergency panic latched — input grabs released".to_string());
+    }
     match ShmWatchdog::open(false) {
         Ok(shm) => {
             let block = shm.block();
@@ -237,6 +340,13 @@ pub fn trigger_panic_release() -> Result<String, String> {
 
 /// Spawns the built-in daemon (`--daemon`) directly from this single executable.
 pub fn start_local_daemon() -> Result<String, String> {
+    if demo_mode_enabled() {
+        return Ok("[DEMO] Local daemon is already running (PID 4211)".to_string());
+    }
+    static LAUNCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _launch = LAUNCH_LOCK
+        .try_lock()
+        .map_err(|_| "The local daemon is already starting; wait for its status.".to_string())?;
     let snap = TelemetrySnapshot::read_current();
     if snap.daemon_online {
         return Ok(format!(
@@ -245,48 +355,102 @@ pub fn start_local_daemon() -> Result<String, String> {
         ));
     }
 
+    duplexd::validate_link_key_config()?;
+
     let self_exe = env::current_exe().map_err(|e| format!("Could not resolve executable: {e}"))?;
+
+    let log_dir = updater::get_config_dir().join("logs");
+    fs::create_dir_all(&log_dir).map_err(|e| format!("Cannot create daemon log directory: {e}"))?;
+    let log_path = log_dir.join("daemon.log");
+    if log_path.exists() {
+        fs::copy(&log_path, log_dir.join("daemon.previous.log"))
+            .map_err(|e| format!("Cannot preserve previous daemon log: {e}"))?;
+    }
+    let log = fs::File::create(&log_path).map_err(|e| format!("Cannot create daemon log: {e}"))?;
+    let error_log = log
+        .try_clone()
+        .map_err(|e| format!("Cannot open daemon error log: {e}"))?;
 
     match Command::new(&self_exe)
         .arg("--daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(error_log))
         .spawn()
     {
-        Ok(child) => Ok(format!(
-            "Started built-in Duplex-KVM daemon + watchdog (PID {})",
-            child.id()
-        )),
+        Ok(mut child) => {
+            let pid = child.id();
+            // Keep concurrent GUI/web clicks serialized until the child has
+            // registered its identity, and report immediate startup failures.
+            for _ in 0..40 {
+                if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                    return Err(format!(
+                        "Daemon exited during startup ({status}). Log: {}",
+                        log_path.display()
+                    ));
+                }
+                let status = TelemetrySnapshot::read_current();
+                if status.daemon_pid == pid && status.daemon_online {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            // Reap the child when it exits; an unreaped PID is not a daemon.
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(format!(
+                "Started built-in Duplex-KVM daemon + watchdog (PID {pid}). Log: {}",
+                log_path.display()
+            ))
+        }
         Err(e) => Err(format!("Failed to start built-in daemon: {e}")),
     }
 }
 
+/// Apply a replaced executable without terminating an active input session.
+pub fn restart_local_daemon() -> Result<String, String> {
+    if demo_mode_enabled() {
+        return start_local_daemon();
+    }
+    duplexd::validate_link_key_config()?;
+    let snapshot = TelemetrySnapshot::read_current();
+    if snapshot.daemon_online {
+        if snapshot.mode != OperationalMode::Mode0Idle
+            || snapshot.input_grab_active
+            || snapshot.virtual_displays_active != 0
+        {
+            return Err("Return to Idle before restarting the daemon.".into());
+        }
+        if !duplex_pal::force_terminate_process(snapshot.daemon_pid) {
+            return Err("Could not stop the Idle daemon.".into());
+        }
+        let reader = ShmWatchdog::open(false).map_err(|e| e.to_string())?;
+        let mut released = false;
+        for _ in 0..150 {
+            if !is_process_alive(snapshot.daemon_pid) && reader.daemon_ownership_available() {
+                released = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !released {
+            return Err(
+                "The old daemon is still closing its devices; wait and click Start daemon.".into(),
+            );
+        }
+    }
+    start_local_daemon()
+}
+
 /// Extracts and runs the embedded OS network & permissions setup script.
 pub fn run_embedded_network_setup() -> Result<String, String> {
+    if demo_mode_enabled() {
+        return Ok("[DEMO] Network setup skipped (192.168.137.0/24)".to_string());
+    }
     #[cfg(target_os = "windows")]
     {
-        let script_path = env::temp_dir().join("duplex-kvm-windows-setup.ps1");
-        fs::write(&script_path, EMBEDDED_WINDOWS_SETUP_PS1)
-            .map_err(|e| format!("Failed to write temp setup script: {e}"))?;
-
-        let ps_cmd = format!(
-            "Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{}\"'",
-            script_path.display()
-        );
-        match Command::new("powershell")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &ps_cmd])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(_) => Ok(
-                "Launched elevated Windows 1GbE Passthrough & Static IP Setup (approve UAC prompt)"
-                    .to_string(),
-            ),
-            Err(e) => Err(format!("Failed to launch PowerShell setup: {e}")),
-        }
+        windows_setup::request_elevated_setup()
     }
 
     #[cfg(target_os = "linux")]
@@ -327,7 +491,7 @@ pub fn run_embedded_network_setup() -> Result<String, String> {
 
         match res {
             Ok(_) => Ok(
-                "Launched Debian 1GbE Link (192.168.137.2/24, metric 700) & udev permissions setup"
+                "Launched Debian manual KVM profile & udev setup. Normal Ethernet/Wi-Fi preserved; select duplex-kvm-1gbe explicitly for the PC link."
                     .to_string(),
             ),
             Err(e) => Err(format!("Failed to launch setup script: {e}")),
@@ -347,12 +511,7 @@ pub fn open_url_in_browser(url: &str) {
     }
     #[cfg(target_os = "windows")]
     {
-        let _ = Command::new("cmd")
-            .args(["/C", "start", "", url])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        windows_setup::open_browser(url);
     }
 }
 
@@ -365,8 +524,15 @@ fn print_cli_telemetry() {
     );
     println!("============================================================");
     println!("  Operational Mode    : {}", s.mode_label);
-    println!("  Peer Link Connected : {} (250ms Dead-Man's Switch)", s.peer_connected);
+    println!(
+        "  Peer Link Connected : {} (250ms Dead-Man's Switch)",
+        s.peer_connected
+    );
     println!("  Input Grab Active   : {}", s.input_grab_active);
+    println!(
+        "  Link diagnosis     : {}",
+        diagnostics::link_status(&s).message
+    );
     println!("  Virtual Displays    : {}", s.virtual_displays_active);
     println!("  Daemon Heartbeat Age: {:.2} ms", s.daemon_age_ms);
     println!("  Peer Heartbeat Age  : {:.2} ms", s.peer_age_ms);
@@ -388,6 +554,24 @@ fn print_cli_telemetry() {
 
 fn main() {
     let args: Vec<String> = env::args().collect();
+    #[cfg(target_os = "windows")]
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--daemon" | "daemon" | "--guard" | "guard"))
+    {
+        unsafe {
+            use windows::Win32::UI::HiDpi::{
+                SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            };
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    if args.get(1).map(String::as_str) == Some("--setup-elevated") {
+        windows_setup::run_elevated_setup();
+        return;
+    }
 
     if let Some(first) = args.get(1).map(|s| s.as_str()) {
         match first {
@@ -426,7 +610,9 @@ fn main() {
                 return;
             }
             "mode" => {
-                let extend_flag = !args.iter().any(|a| a == "--no-display" || a == "--input-only");
+                let extend_flag = !args
+                    .iter()
+                    .any(|a| a == "--no-display" || a == "--input-only");
                 let target = match args.get(2).map(|s| s.as_str()).unwrap_or("idle") {
                     "pc" | "1" => OperationalMode::Mode1PcPrimary {
                         extend_display: extend_flag,
@@ -439,6 +625,131 @@ fn main() {
                     Err(err) => {
                         eprintln!("{err}");
                         std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            "update" | "--update" => {
+                let sub = args.get(2).map(|s| s.as_str()).unwrap_or("check");
+                match sub {
+                    "install" | "apply" | "now" => {
+                        println!("Checking and installing latest Duplex-KVM release...");
+                        match updater::install_update() {
+                            Ok(msg) => println!("{msg}"),
+                            Err(e) => {
+                                eprintln!("Update failed: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                    _ => {
+                        let repo = updater::AppConfig::load().effective_repo();
+                        println!("Checking for updates from https://github.com/{repo}...");
+                        match updater::check_for_updates(true) {
+                            Ok(status) => {
+                                println!("Current Version : {}", status.current_version);
+                                println!(
+                                    "Latest Release  : {}",
+                                    status
+                                        .latest_version
+                                        .unwrap_or_else(|| "Unknown".to_string())
+                                );
+                                if status.update_available {
+                                    println!("Status          : UPDATE AVAILABLE!");
+                                    println!(
+                                        "Run 'duplex-kvm update install' to download and install."
+                                    );
+                                    if let Some(notes) = status.release_notes {
+                                        println!("\nRelease Notes:\n{notes}");
+                                    }
+                                } else {
+                                    println!("Status          : Duplex-KVM is up to date.");
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Error checking for updates: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            "--check-update" => {
+                match updater::check_for_updates(true) {
+                    Ok(status) => {
+                        if status.update_available {
+                            println!(
+                                "Update available: {}",
+                                status.latest_version.unwrap_or_default()
+                            );
+                        } else {
+                            println!("Up to date ({})", status.current_version);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Error checking for updates: {e}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            "config" => {
+                let sub = args.get(2).map(|s| s.as_str()).unwrap_or("show");
+                let mut cfg = updater::AppConfig::load();
+                match sub {
+                    "set-token" => {
+                        if let Some(token) = args.get(3) {
+                            cfg.github_token = Some(token.trim().to_string());
+                            match cfg.save() {
+                                Ok(()) => println!(
+                                    "GitHub Personal Access Token saved successfully to {:?}.\nMasked: {}",
+                                    updater::get_config_path(),
+                                    updater::mask_token(token)
+                                ),
+                                Err(e) => {
+                                    eprintln!("Failed to save config: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            eprintln!("Usage: duplex-kvm config set-token <ghp_your_token>");
+                            std::process::exit(1);
+                        }
+                    }
+                    "set-repo" => {
+                        if let Some(repo) = args.get(3) {
+                            cfg.repo = repo.trim().to_string();
+                            match cfg.save() {
+                                Ok(()) => println!(
+                                    "Repository updated to '{}' in {:?}",
+                                    repo,
+                                    updater::get_config_path()
+                                ),
+                                Err(e) => {
+                                    eprintln!("Failed to save config: {e}");
+                                    std::process::exit(1);
+                                }
+                            }
+                        } else {
+                            eprintln!("Usage: duplex-kvm config set-repo <owner/repo>");
+                            std::process::exit(1);
+                        }
+                    }
+                    _ => {
+                        println!(
+                            "Duplex-KVM Configuration ({:?}):",
+                            updater::get_config_path()
+                        );
+                        println!("  Repository          : {}", cfg.effective_repo());
+                        println!(
+                            "  GitHub Token        : {}",
+                            cfg.masked_token().unwrap_or_else(|| {
+                                "Not configured (set via 'duplex-kvm config set-token <tok>' or DUPLEX_GITHUB_TOKEN)".to_string()
+                            })
+                        );
+                        println!("  Auto Check Updates  : {}", cfg.auto_check_updates);
+                        println!("  Auto Install Updates: {}", cfg.auto_install_updates);
                     }
                 }
                 return;
@@ -473,8 +784,13 @@ fn main() {
         return;
     }
 
-    // Automatically start the local daemon + 250ms watchdog when the user opens the GUI
-    let _ = start_local_daemon();
+    // Start background update checker
+    updater::start_background_checker();
+
+    // Input capture and network control start only after an explicit request.
+    if args.iter().any(|a| a == "--autostart") && !args.iter().any(|a| a == "--no-autostart") {
+        let _ = start_local_daemon();
+    }
 
     if web_only {
         web::run_web_server_blocking(port, !no_browser);

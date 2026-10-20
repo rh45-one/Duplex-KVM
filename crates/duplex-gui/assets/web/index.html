@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Duplex — Control center</title>
+<link rel="icon" href="data:,">
+<link rel="preload" href="/fonts/DuplexDots-Bold.ttf" as="font" type="font/ttf" crossorigin>
+<link rel="stylesheet" href="/control.css">
+<script src="/control.js" defer></script>
+</head>
+<body>
+<header class="masthead">
+  <a class="wordmark" href="/" aria-label="Duplex home">duplex<span class="muted"> / kvm</span></a>
+  <div class="header-right"><span class="label">CONTROL CENTER / 01</span><label class="theme-label"><span class="sr-only">Appearance</span><select id="appearance"><option value="dark">DARK</option><option value="light">LIGHT</option></select></label></div>
+</header>
+<main>
+  <section class="hero" aria-labelledby="mode-title">
+    <div>
+      <p class="label" id="hero-state">CURRENT MODE</p>
+      <div class="hero-heading"><span id="val-mode" class="hero-number">—</span><h1 id="mode-title">Connecting</h1></div>
+      <p id="sub-mode" class="muted">Waiting for local telemetry.</p>
+    </div>
+    <div class="link-status">
+      <div class="status-row"><span class="label">LOCAL DAEMON</span><span id="daemon-badge" class="badge">CONNECTING</span></div>
+      <div class="status-row"><span class="label">WIRED PEER</span><span id="peer-badge" class="badge">CONNECTING</span></div>
+      <p id="link-detail" role="status" class="muted"></p>
+      <div class="heartbeat"><div class="status-row"><span class="label">DEAD-MAN'S SWITCH</span><span class="label" id="heartbeat-value">— / 250 MS</span></div><div class="segments" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div></div>
+    </div>
+  </section>
+  <section class="modes" aria-labelledby="modes-heading">
+    <div class="section-heading"><h2 id="modes-heading">01 / Routing</h2><span class="label">CTRL + ALT + P TO CYCLE</span></div>
+    <div class="mode-buttons">
+      <button id="btn-mode-0" title="Local peripherals. Independent displays." onclick="setMode('idle')" aria-pressed="false"><span class="tile-top"><span class="label">MODE 0</span><span class="selection" aria-hidden="true"></span></span><span class="btn-title">Idle</span><span class="btn-desc">Local peripherals. Independent displays.</span><span class="label shortcut">CTRL + ALT + 0</span></button>
+      <button id="btn-mode-3" title="Control Windows from the laptop." onclick="setMode('pc_kvm')" aria-pressed="false"><span class="tile-top"><span class="label">MODE 1</span><span class="selection" aria-hidden="true"></span></span><span class="btn-title">PC primary</span><span class="btn-desc">Control Windows from the laptop.</span><span class="label shortcut">CTRL + ALT + 1</span></button>
+      <button id="btn-mode-1" title="Control Windows. Extend to the laptop." onclick="setMode('pc_extend')" aria-pressed="false"><span class="tile-top"><span class="label">MODE 1+</span><span class="selection" aria-hidden="true"></span></span><span class="btn-title">PC + display</span><span class="btn-desc">Control Windows. Extend to the laptop.</span><span class="label shortcut">CTRL + ALT + 2</span></button>
+      <button id="btn-mode-2" title="Dock PC peripherals and both monitors." onclick="setMode('laptop')" aria-pressed="false"><span class="tile-top"><span class="label">MODE 2</span><span class="selection" aria-hidden="true"></span></span><span class="btn-title">Laptop primary</span><span class="btn-desc">Dock PC peripherals and both monitors.</span><span class="label shortcut">CTRL + ALT + 3</span></button>
+    </div>
+    <p id="action-status" role="status" aria-live="polite">[READY]</p>
+  </section>
+  <section aria-labelledby="telemetry-heading">
+    <div class="section-heading"><h2 id="telemetry-heading">02 / Telemetry</h2><span class="label" id="connection-status">[CONNECTING]</span></div>
+    <div class="telemetry">
+      <div class="metric"><p class="label">LINK RTT / MIN · CURRENT · MAX</p><p id="val-rtt" class="value">— / — / — µs</p><p class="label">1 GBE / 50 HZ HEARTBEAT</p></div>
+      <div class="metric"><p class="label">INPUT / VIRTUAL DISPLAYS</p><p id="val-grab" class="value">—</p><p id="sub-hb" class="label">DAEMON HB: — / PEER HB: —</p></div>
+      <div class="metric"><p class="label">HID BATCHES / TX · RX</p><p id="val-hid" class="value">— / —</p><p class="label">CHACHA20-POLY1305 / UDP 48100</p></div>
+      <div class="metric"><p class="label">VIDEO FRAMES / TX · RX</p><p id="val-vid" class="value">— / —</p><p class="label">NATIVE DESKTOP / BOUNDED TRAFFIC</p></div>
+      <div class="metric"><p class="label">KEYFRAME RECOVERIES</p><p id="val-pli" class="value">—</p><p class="label">PLI / GAP DETECTION</p></div>
+    </div>
+  </section>
+  <section class="system" aria-labelledby="system-heading">
+    <div class="section-heading"><h2 id="system-heading">03 / System</h2><span class="label">LOCAL CONTROL</span></div>
+    <div class="system-actions"><button onclick="startDaemon()">Start daemon <span aria-hidden="true">↗</span></button><button onclick="postAction('/api/restart-daemon')">Restart daemon <span aria-hidden="true">↗</span></button><button onclick="setupNetwork()">Set up network <span aria-hidden="true">↗</span></button><button onclick="postAction('/api/connect-link')">Connect PC link <span aria-hidden="true">↗</span></button><button class="panic" onclick="triggerPanic()">Emergency release <span class="label">CTRL + ALT + SHIFT + BKSP</span></button></div>
+    <p class="muted">Native-resolution/full-colour streaming requires the current Duplex build on both computers. Mode 1+ also needs a Windows virtual display driver. Install the <a href="https://github.com/VirtualDrivers/Virtual-Display-Driver/releases" target="_blank" rel="noopener noreferrer">VirtualDrivers Virtual Display Driver</a> on Windows and enable the laptop resolution in its supported modes. Duplex uses the real virtual output; physical monitors remain separate.</p>
+    <p class="label safety-note">EMERGENCY RELEASE RETURNS TO IDLE AND RELEASES ALL INPUT GRABS.</p>
+  </section>
+  <details id="pairing" class="updates" open><summary><span>Pair computers</span><span id="pairing-badge" class="label">SET UP</span></summary><div class="update-content">
+    <p id="pairing-detail" role="status" class="muted">Create a key on one computer, then copy and save the same key on the other.</p>
+    <p class="muted">Use a private channel to transfer the key. It is saved for future launches. Matching fingerprints confirm that both computers use the same key.</p>
+    <label for="pairing-key" class="label">PAIRING KEY</label>
+    <div class="token-input"><input id="pairing-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the key from the other computer"><button onclick="savePairingKey()">Save key</button><button onclick="copyPairingKey()">Copy key</button></div>
+    <div class="update-actions"><button onclick="generatePairingKey()">Generate a key on this computer</button></div>
+    <p class="muted">Internet sharing works independently. On Linux, connect the PC cable and select the manual duplex-kvm-1gbe network profile with passthrough enabled.</p>
+  </div></details>
+  <details class="updates"><summary><span>Software &amp; updates <span id="app-version" class="muted">v0.1.0</span></span><span class="label">CONFIGURE +</span></summary><div class="update-content">
+    <div class="update-heading"><span id="update-badge" class="badge">CHECKING</span><p id="update-detail" class="muted">Checking repository releases…</p></div>
+    <div class="update-actions"><button id="btn-check-update" onclick="checkUpdate()">Check for updates</button><button id="btn-install-update" onclick="installUpdate()" style="display:none">Install update</button><button onclick="toggleTokenConfig()" aria-controls="token-config-box">Configure GitHub token</button></div>
+    <div class="update-preferences"><label><input id="auto-check-updates" type="checkbox" onchange="saveUpdatePreferences()"> Check automatically</label> <label><input id="auto-install-updates" type="checkbox" onchange="saveUpdatePreferences()"> Install verified updates automatically (restart required)</label></div>
+    <div id="token-config-box" style="display:none"><label for="input-token" class="label">GITHUB PERSONAL ACCESS TOKEN</label><p class="muted">For private releases, use a token with Contents: Read access. Saved to your local configuration.</p><div class="token-input"><input type="password" id="input-token" placeholder="Enter token" autocomplete="off" spellcheck="false"><button onclick="saveToken()">Save token</button></div></div>
+  </div></details>
+</main>
+<footer><span class="label">DUPLEX SYSTEMS / BIDIRECTIONAL WIRED KVM</span><span class="label">LOCALHOST / ENCRYPTED LINK</span></footer>
+</body>
+</html>

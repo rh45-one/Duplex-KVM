@@ -15,313 +15,125 @@ use std::time::Duration;
 
 pub const DEFAULT_WEB_PORT: u16 = 48180;
 
-const INDEX_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Duplex-KVM Control Center</title>
-<style>
-  :root {
-    --bg: #0f172a;
-    --panel: #1e293b;
-    --panel-border: #334155;
-    --text: #f8fafc;
-    --muted: #94a3b8;
-    --accent: #38bdf8;
-    --green: #22c55e;
-    --amber: #f59e0b;
-    --red: #ef4444;
-  }
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    padding: 24px;
-    max-width: 860px;
-    margin: 0 auto;
-  }
-  header {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 12px;
-    padding: 18px 22px;
-    margin-bottom: 18px;
-  }
-  .title h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.02em; }
-  .title p { font-size: 13px; color: var(--muted); margin-top: 4px; }
-  .badges { display: flex; gap: 10px; align-items: center; }
-  .badge {
-    padding: 6px 12px;
-    border-radius: 999px;
-    font-size: 12px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-  }
-  .badge.ok { background: rgba(34, 197, 94, 0.18); color: #4ade80; border: 1px solid rgba(34, 197, 94, 0.4); }
-  .badge.warn { background: rgba(245, 158, 11, 0.18); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
-  .badge.err { background: rgba(239, 68, 68, 0.18); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
-
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(3, 1fr);
-    gap: 12px;
-    margin-bottom: 18px;
-  }
-  .card {
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 10px;
-    padding: 14px 16px;
-  }
-  .card .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
-  .card .value { font-size: 16px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
-  .card .sub { font-size: 12px; color: var(--muted); margin-top: 3px; font-variant-numeric: tabular-nums; }
-
-  .section {
-    background: var(--panel);
-    border: 1px solid var(--panel-border);
-    border-radius: 12px;
-    padding: 18px 22px;
-    margin-bottom: 18px;
-  }
-  .section h2 {
-    font-size: 14px;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    margin-bottom: 14px;
-  }
-  .mode-buttons {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 12px;
-  }
-  button {
-    cursor: pointer;
-    border-radius: 9px;
-    border: 1px solid var(--panel-border);
-    background: #26354d;
-    color: var(--text);
-    padding: 13px 16px;
-    text-align: left;
-    transition: all 0.12s ease;
-    font-family: inherit;
-  }
-  button:hover { background: #314463; border-color: var(--accent); }
-  button.active {
-    background: rgba(56, 189, 248, 0.18);
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px var(--accent);
-  }
-  button .btn-title { font-size: 14px; font-weight: 700; display: block; }
-  button .btn-desc { font-size: 12px; color: var(--muted); margin-top: 4px; display: block; }
-
-  .actions-row {
-    display: flex;
-    gap: 12px;
-  }
-  .btn-start {
-    flex: 1;
-    background: rgba(34, 197, 94, 0.16);
-    border-color: rgba(34, 197, 94, 0.5);
-    text-align: center;
-  }
-  .btn-start:hover { background: rgba(34, 197, 94, 0.28); border-color: #4ade80; }
-  .btn-panic {
-    flex: 1.4;
-    background: rgba(239, 68, 68, 0.2);
-    border-color: rgba(239, 68, 68, 0.65);
-    text-align: center;
-  }
-  .btn-panic:hover { background: rgba(239, 68, 68, 0.35); border-color: #f87171; }
-  #toast {
-    margin-top: 12px;
-    font-size: 13px;
-    color: var(--accent);
-    min-height: 18px;
-  }
-</style>
-</head>
-<body>
-  <header>
-    <div class="title">
-      <h1>Duplex-KVM Control Center</h1>
-      <p>1 Gbps Bidirectional Wired KVM, Virtual Display Streamer &amp; 250ms Dead-Man's Switch</p>
-    </div>
-    <div class="badges">
-      <span id="daemon-badge" class="badge err">DAEMON OFFLINE</span>
-      <span id="peer-badge" class="badge warn">PEER IDLE</span>
-    </div>
-  </header>
-
-  <div class="grid">
-    <div class="card">
-      <div class="label">Operational Mode</div>
-      <div id="val-mode" class="value">MODE 0: IDLE</div>
-      <div id="sub-mode" class="sub">Local peripherals &amp; displays independent</div>
-    </div>
-    <div class="card">
-      <div class="label">Grab &amp; Virtual Displays</div>
-      <div id="val-grab" class="value">Grab: OFF | Displays: 0</div>
-      <div id="sub-hb" class="sub">Daemon HB: -- ms | Peer HB: -- ms</div>
-    </div>
-    <div class="card">
-      <div class="label">1GbE Link RTT (Min / Cur / Max)</div>
-      <div id="val-rtt" class="value">0.0 / 0.0 / 0.0 &mu;s</div>
-      <div class="sub">DSCP CS6 (0xC0) 50 Hz Heartbeat</div>
-    </div>
-    <div class="card">
-      <div class="label">Encrypted HID Batches (TX / RX)</div>
-      <div id="val-hid" class="value">0 / 0</div>
-      <div class="sub">UDP 48100 &bull; ChaCha20-Poly1305 &bull; DSCP EF</div>
-    </div>
-    <div class="card">
-      <div class="label">HEVC Video Frames (TX / RX)</div>
-      <div id="val-vid" class="value">0 / 0</div>
-      <div class="sub">UDP 48102-3 &bull; 60 Mbps Cap &bull; DSCP AF41</div>
-    </div>
-    <div class="card">
-      <div class="label">PLI Keyframe Recoveries</div>
-      <div id="val-pli" class="value">0</div>
-      <div class="sub">Zero-Artifact Gap Detection</div>
-    </div>
-  </div>
-
-  <div class="section">
-    <h2>Switch Operational Mode &mdash; Shortcut: <span style="color:var(--accent)">Ctrl+Alt+P</span> (Cycle) | <span style="color:var(--accent)">Ctrl+Alt+0..3</span></h2>
-    <div class="mode-buttons">
-      <button id="btn-mode-0" onclick="setMode('idle')">
-        <span class="btn-title">Mode 0 &mdash; Idle (Local Only) [Ctrl+Alt+0]</span>
-        <span class="btn-desc">Release all input grabs &amp; virtual displays; keep 1GbE internet passthrough active.</span>
-      </button>
-      <button id="btn-mode-3" onclick="setMode('pc_kvm')">
-        <span class="btn-title">Mode 1 &mdash; PC Primary (KVM Input Only) [Ctrl+Alt+1]</span>
-        <span class="btn-desc">Debian Laptop keyboard &amp; trackpad control the Windows 11 Desktop.</span>
-      </button>
-      <button id="btn-mode-1" onclick="setMode('pc_extend')">
-        <span class="btn-title">Mode 1+ &mdash; PC Primary (+ Extend Display) [Ctrl+Alt+2]</span>
-        <span class="btn-desc">Laptop controls Windows PC + extends 1 Windows virtual monitor onto Laptop screen.</span>
-      </button>
-      <button id="btn-mode-2" onclick="setMode('laptop')">
-        <span class="btn-title">Mode 2 &mdash; Dock PC Dual Monitors to Laptop [Ctrl+Alt+3]</span>
-        <span class="btn-desc">Windows USB keyboard/mouse &amp; 2 physical monitors dock to the Debian Laptop.</span>
-      </button>
-    </div>
-    <div id="toast"></div>
-  </div>
-
-  <div class="section">
-    <h2>Daemon Supervision, 1-Click Network Setup &amp; Emergency Safety</h2>
-    <div class="actions-row" style="margin-bottom: 12px;">
-      <button class="btn-start" onclick="startDaemon()">
-        <span class="btn-title">Start Local Daemon</span>
-        <span class="btn-desc">Spawns background daemon + 250ms watchdog from this single executable</span>
-      </button>
-      <button class="btn-start" onclick="setupNetwork()">
-        <span class="btn-title">1-Click Setup 1GbE Network</span>
-        <span class="btn-desc">Configures 192.168.137.x static subnet, NAT passthrough &amp; udev/Firewall</span>
-      </button>
-    </div>
-    <div class="actions-row">
-      <button class="btn-panic" onclick="triggerPanic()">
-        <span class="btn-title">EMERGENCY PANIC / UNGRAB ALL (Ctrl+Alt+Shift+Bksp)</span>
-        <span class="btn-desc">Immediately releases input grabs, unsticks modifiers &amp; forces Mode 0 Idle</span>
-      </button>
-    </div>
-  </div>
-
-<script>
-async function postAction(url) {
-  try {
-    const res = await fetch(url, { method: 'POST' });
-    const data = await res.json();
-    document.getElementById('toast').textContent = data.message || 'Command sent.';
-    refreshStatus();
-  } catch (e) {
-    document.getElementById('toast').textContent = 'Request failed: ' + e;
-  }
-}
-function setMode(target) { postAction('/api/mode?target=' + encodeURIComponent(target)); }
-function triggerPanic() { postAction('/api/panic'); }
-function startDaemon() { postAction('/api/start-daemon'); }
-function setupNetwork() { postAction('/api/setup-network'); }
-
-window.addEventListener('keydown', (e) => {
-  if (e.ctrlKey && (e.altKey || e.metaKey)) {
-    const k = e.key.toLowerCase();
-    if (k === 'p') { e.preventDefault(); setMode('cycle'); }
-    else if (k === '0') { e.preventDefault(); setMode('idle'); }
-    else if (k === '1') { e.preventDefault(); setMode('pc_kvm'); }
-    else if (k === '2') { e.preventDefault(); setMode('pc_extend'); }
-    else if (k === '3') { e.preventDefault(); setMode('laptop'); }
-  }
-});
-
-async function refreshStatus() {
-  try {
-    const res = await fetch('/api/status');
-    const s = await res.json();
-    const dBadge = document.getElementById('daemon-badge');
-    if (s.daemon_online) {
-      dBadge.className = 'badge ok';
-      dBadge.textContent = 'DAEMON ONLINE (PID ' + s.daemon_pid + ')';
-    } else {
-      dBadge.className = 'badge err';
-      dBadge.textContent = 'DAEMON OFFLINE';
-    }
-    const pBadge = document.getElementById('peer-badge');
-    if (s.peer_connected) {
-      pBadge.className = 'badge ok';
-      pBadge.textContent = '1GbE PEER CONNECTED';
-    } else {
-      pBadge.className = 'badge warn';
-      pBadge.textContent = 'PEER LINK STANDBY';
-    }
-    document.getElementById('val-mode').textContent = s.mode_label;
-    document.getElementById('sub-mode').textContent = s.mode_subtitle;
-    document.getElementById('val-grab').textContent =
-      'Grab: ' + (s.input_grab_active ? 'ACTIVE' : 'OFF') + ' | Displays: ' + s.virtual_displays_active;
-    document.getElementById('sub-hb').textContent =
-      'Daemon HB: ' + s.daemon_age_ms.toFixed(1) + ' ms | Peer HB: ' + s.peer_age_ms.toFixed(1) + ' ms';
-    document.getElementById('val-rtt').textContent =
-      s.min_rtt_us.toFixed(1) + ' / ' + s.last_rtt_us.toFixed(1) + ' / ' + s.max_rtt_us.toFixed(1) + ' \u00b5s';
-    document.getElementById('val-hid').textContent = s.tx_hid_packets + ' / ' + s.rx_hid_packets;
-    document.getElementById('val-vid').textContent = s.tx_video_frames + ' / ' + s.rx_video_frames;
-    document.getElementById('val-pli').textContent = String(s.pli_keyframes_requested);
-
-    for (const code of [0, 1, 2, 3]) {
-      const btn = document.getElementById('btn-mode-' + code);
-      if (btn) btn.className = (s.mode_code === code && s.daemon_online) ? 'active' : '';
-    }
-  } catch (_) {}
-}
-setInterval(refreshStatus, 250);
-refreshStatus();
-</script>
-</body>
-</html>
-"#;
+const INDEX_HTML: &str = include_str!("../assets/web/index.html");
 
 fn handle_http_client(mut stream: TcpStream) {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
 
+    let mut bytes = Vec::new();
     let mut buf = [0u8; 2048];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
+    let header_end = loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+        }
+        if bytes.len() > 16_384 {
+            return;
+        }
+        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            break end + 4;
+        }
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let headers = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+    let content_length = headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+        .map(|(_, value)| value.trim().parse::<usize>())
+        .transpose();
+    let body_len = match content_length {
+        Ok(value) => value.unwrap_or(0),
+        Err(_) => return,
+    };
+    if header_end + body_len > 16_384 {
+        return;
+    }
+    while bytes.len() < header_end + body_len {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+        }
+    }
+    let body = &bytes[header_end..header_end + body_len];
+    let req = headers;
     let first_line = req.lines().next().unwrap_or("");
     let mut parts = first_line.split_whitespace();
     let method = parts.next().unwrap_or("GET");
     let path = parts.next().unwrap_or("/");
+
+    // Restrict the Host as well as Origin: pairing returns a newly generated
+    // secret and must not be exposed through a DNS-rebinding origin.
+    let host = req
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+        .map(|(_, v)| v.trim());
+    let port = match stream.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(_) => return,
+    };
+    if ![format!("127.0.0.1:{port}"), format!("localhost:{port}")]
+        .iter()
+        .any(|expected| Some(expected.as_str()) == host)
+    {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
+
+    // Browser requests that mutate local state must originate from this control UI.
+    if method == "POST" {
+        let cross_site = req
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .any(|(key, value)| {
+                key.eq_ignore_ascii_case("sec-fetch-site") && value.trim() == "cross-site"
+            });
+        let host = req
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.trim());
+        let wrong_origin = req
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.eq_ignore_ascii_case("origin"))
+            .is_some_and(|(_, origin)| {
+                host.map(|h| format!("http://{h}")).as_deref() != Some(origin.trim())
+            });
+        if cross_site || wrong_origin {
+            let _ = stream.write_all(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+            return;
+        }
+    }
+
+    if method == "GET" {
+        let asset: Option<(&str, &[u8])> = match path {
+            "/control.css" => Some((
+                "text/css; charset=utf-8",
+                include_bytes!("../assets/web/control.css"),
+            )),
+            "/control.js" => Some((
+                "text/javascript; charset=utf-8",
+                include_bytes!("../assets/web/control.js"),
+            )),
+            _ => path.strip_prefix("/fonts/").and_then(|name| {
+                crate::design::fonts::ALL
+                    .iter()
+                    .find(|(file, _)| *file == name)
+                    .map(|(_, bytes)| ("font/ttf", *bytes))
+            }),
+        };
+        if let Some((content_type, bytes)) = asset {
+            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", bytes.len());
+            let _ = stream.write_all(header.as_bytes());
+            let _ = stream.write_all(bytes);
+            return;
+        }
+    }
 
     if method == "GET" && (path == "/" || path.starts_with("/index")) {
         let resp = format!(
@@ -335,7 +147,9 @@ fn handle_http_client(mut stream: TcpStream) {
 
     if method == "GET" && path.starts_with("/api/status") {
         let snap = TelemetrySnapshot::read_current();
-        let json = snap.to_json();
+        let mut status: serde_json::Value = serde_json::from_str(&snap.to_json()).unwrap();
+        status["link"] = serde_json::to_value(crate::diagnostics::link_status(&snap)).unwrap();
+        let json = status.to_string();
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
             json.len(),
@@ -384,12 +198,32 @@ fn handle_http_client(mut stream: TcpStream) {
         return;
     }
 
+    if method == "POST" && path == "/api/restart-daemon" {
+        let result = crate::restart_local_daemon();
+        write_json_value(
+            &mut stream,
+            serde_json::json!({"ok": result.is_ok(),
+            "message": result.unwrap_or_else(|error| error)}),
+        );
+        return;
+    }
+
     if method == "POST" && path.starts_with("/api/start-daemon") {
         let msg = match start_local_daemon() {
             Ok(m) => m,
             Err(e) => e,
         };
         write_json_message(&mut stream, &msg);
+        return;
+    }
+
+    if method == "POST" && path == "/api/connect-link" {
+        let result = crate::diagnostics::connect_pc_link();
+        write_json_value(
+            &mut stream,
+            serde_json::json!({"ok": result.is_ok(),
+            "message": result.unwrap_or_else(|error| error)}),
+        );
         return;
     }
 
@@ -402,19 +236,165 @@ fn handle_http_client(mut stream: TcpStream) {
         return;
     }
 
-    let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
+    if method == "GET" && path == "/api/pairing" {
+        use sha2::{Digest, Sha256};
+        let status = match duplexd::pairing::load_key() {
+            Ok(key) => {
+                let fingerprint: String = Sha256::digest(key)
+                    .iter()
+                    .take(8)
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                serde_json::json!({"configured": true, "fingerprint": &fingerprint[..16],
+                    "environment_override": std::env::var_os("DUPLEX_PSK_HEX").is_some()})
+            }
+            Err(error) => serde_json::json!({"configured": false, "error": error}),
+        };
+        write_json_value(&mut stream, status);
+        return;
+    }
+
+    if method == "POST" && matches!(path, "/api/pairing/generate" | "/api/pairing/save") {
+        if TelemetrySnapshot::read_current().daemon_online {
+            write_json_value(
+                &mut stream,
+                serde_json::json!({"ok": false, "message": "Stop the daemon before changing its pairing key."}),
+            );
+            return;
+        }
+        let key = if path.ends_with("generate") {
+            duplexd::pairing::generate_key()
+        } else {
+            serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|value| value.get("key").and_then(|v| v.as_str()).map(str::to_owned))
+                .ok_or_else(|| "Paste the pairing key from your other computer".to_string())
+        };
+        let result = key.and_then(|key| {
+            duplexd::pairing::save_key(&key)?;
+            Ok(key.trim().to_lowercase())
+        });
+        let response = match result {
+            Ok(key) if path.ends_with("generate") => serde_json::json!({"ok": true, "key": key,
+                "message": "Key saved on this computer. Copy it privately and save it on the other computer, then start both daemons."}),
+            Ok(_) => {
+                serde_json::json!({"ok": true, "message": "Pairing key saved. Start the daemon on both computers."})
+            }
+            Err(error) => serde_json::json!({"ok": false, "message": error}),
+        };
+        write_json_value(&mut stream, response);
+        return;
+    }
+
+    if method == "GET" && path.starts_with("/api/update") {
+        let status = crate::updater::get_update_status();
+        let cfg = crate::updater::AppConfig::load();
+        let json = serde_json::json!({
+            "status": status,
+            "repo": cfg.effective_repo(),
+            "has_token": cfg.effective_token().is_some(),
+            "masked_token": cfg.masked_token(),
+            "auto_check": cfg.auto_check_updates,
+            "auto_install": cfg.auto_install_updates,
+        })
+        .to_string();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}",
+            json.len(),
+            json
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        return;
+    }
+
+    if method == "POST" && path == "/api/update/check" {
+        thread::spawn(|| {
+            let _ = crate::updater::check_for_updates(true);
+        });
+        write_json_message(
+            &mut stream,
+            "Checking repository releases; progress appears under Software & updates.",
+        );
+        return;
+    }
+
+    if method == "POST" && path == "/api/update/install" {
+        thread::spawn(|| {
+            let _ = crate::updater::install_update();
+        });
+        write_json_message(
+            &mut stream,
+            "Installing update; progress appears under Software & updates.",
+        );
+        return;
+    }
+
+    if method == "POST" && path == "/api/config/updates" {
+        #[derive(serde::Deserialize)]
+        struct Preferences {
+            auto_check: bool,
+            auto_install: bool,
+        }
+        let preferences = match serde_json::from_slice::<Preferences>(body) {
+            Ok(value) => value,
+            Err(_) => {
+                write_json_message(&mut stream, "Invalid update preferences");
+                return;
+            }
+        };
+        let mut config = crate::updater::AppConfig::load();
+        config.auto_check_updates = preferences.auto_check;
+        config.auto_install_updates = preferences.auto_install;
+        let message = config
+            .save()
+            .map(|()| "Update preferences saved".to_string())
+            .unwrap_or_else(|e| e);
+        write_json_message(&mut stream, &message);
+        return;
+    }
+
+    if method == "POST" && path == "/api/config/token" {
+        let decoded = match serde_json::from_slice::<serde_json::Value>(body) {
+            Ok(value) => match value.get("token").and_then(|v| v.as_str()) {
+                Some(token) => token.to_string(),
+                None => {
+                    write_json_message(&mut stream, "Missing token field");
+                    return;
+                }
+            },
+            Err(_) => {
+                write_json_message(&mut stream, "Invalid token request");
+                return;
+            }
+        };
+        let mut cfg = crate::updater::AppConfig::load();
+        cfg.github_token = if decoded.trim().is_empty() {
+            None
+        } else {
+            Some(decoded.trim().to_string())
+        };
+        let msg = match cfg.save() {
+            Ok(()) => "GitHub Personal Access Token saved successfully.".to_string(),
+            Err(e) => format!("Failed to save token: {e}"),
+        };
+        write_json_message(&mut stream, &msg);
+        return;
+    }
+
+    let not_found =
+        "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nNot Found";
     let _ = stream.write_all(not_found.as_bytes());
 }
 
 fn write_json_message(stream: &mut TcpStream, msg: &str) {
-    let escaped = msg.replace('\\', "\\\\").replace('"', "\\\"");
-    let body = format!("{{\"message\":\"{escaped}\"}}");
-    let resp = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(resp.as_bytes());
+    write_json_value(stream, serde_json::json!({"message": msg}));
+}
+
+fn write_json_value(stream: &mut TcpStream, value: serde_json::Value) {
+    let body = value.to_string();
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{}", body.len(), body);
+    let _ = stream.write_all(response.as_bytes());
 }
 
 /// Spawns the localhost Web Control Center on `127.0.0.1:port` in a background daemon thread.

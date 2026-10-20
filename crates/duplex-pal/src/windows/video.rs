@@ -1,118 +1,167 @@
-//! Windows 11 Built-In Low-Latency Video Pipeline (Win32 GDI `StretchBlt` Capture + `DPXB` Band Codec + Borderless Fullscreen Win32 Viewers).
+//! Windows 11 screen streaming.
 //!
-//! Implements `VideoPipelineBackend` on Windows 11 with zero external CLI dependencies:
-//! - **Mode 1+ Sender (Extended Monitor -> Debian Laptop):** Captures the Windows desktop monitor
-//!   at `960x540` via pure Win32 GDI (`GetDC`, `CreateCompatibleDC`, `CreateDIBSection`, `StretchBlt`),
-//!   overlays the live hardware cursor, and encodes changed horizontal bands via `encode_bgrx_frame_to_bands` (`DPXB`).
-//! - **Mode 2 Viewer (2 Physical Monitors <- Debian Laptop):** Enumerates all physical monitors via
-//!   `EnumDisplayMonitors`, spawns borderless fullscreen Win32 viewer windows (`WS_POPUP | WS_VISIBLE`)
-//!   covering Monitor 1 and Monitor 2, decodes incoming `DPXB` bands via `decode_band_into_bgrx`, and
-//!   blits live frames via `StretchDIBits`.
+//! - **Sender (Mode 1+):** the Duplex-owned virtual output is captured with
+//!   DXGI Desktop Duplication (GDI fallback), the real cursor is composited,
+//!   and the shared encoder codes DPXT tiles on the low-priority codec pool.
+//! - **Viewer (Mode 2):** one borderless topmost window per physical monitor.
+//!   A decoder thread copies changed regions into the window's front buffer and
+//!   invalidates them; the window thread repaints at native resolution (1:1
+//!   when sizes match, otherwise aspect-preserving HALFTONE scaling). The local
+//!   cursor is hidden over viewers while Windows input drives the laptop.
 
-use crate::shm::monotonic_now_ns;
-use crate::{PalError, VideoPipelineBackend};
+use super::capture::{spawn_capture, CaptureTarget};
+use crate::stream::{
+    encoder_config_from_env, spawn_encoder, EncoderControl, EncoderSpec, FramePresenter, FrameSlot,
+    StreamCodec, ViewerSet,
+};
+use crate::{PalError, PeerVideoCaps, VideoFrameConsumer, VideoPipelineBackend, VideoSink};
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::ptr;
-use core::sync::atomic::{AtomicBool, Ordering};
-use duplex_proto::{
-    decode_band_into_bgrx, encode_bgrx_frame_to_bands, CursorTelemetry, DisplayDescriptor,
-    EncodedVideoFrame, DPXB_BAND_MAGIC, MAX_VIDEO_BITRATE_KBPS,
-};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use duplex_proto::{DisplayDescriptor, PixelRect};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-use tracing::{debug, info};
+use tracing::{info, warn};
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{BOOL, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, EnumDisplayMonitors, GetDC,
-    GetMonitorInfoW, GetStockObject, ReleaseDC, SelectObject, SetStretchBltMode, StretchBlt,
-    StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACK_BRUSH, COLORONCOLOR, DIB_RGB_COLORS,
-    HBRUSH, HDC, HGDIOBJ, HMONITOR, MONITORINFO, SRCCOPY,
+    BeginPaint, EndPaint, FillRect, GetStockObject, InvalidateRect, SetBrushOrgEx,
+    SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLACK_BRUSH,
+    COLORONCOLOR, DIB_RGB_COLORS, HALFTONE, HBRUSH, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, PeekMessageW,
-    RegisterClassW, SetCursorPos, ShowWindow, TranslateMessage, HMENU, MSG, PM_REMOVE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_ERASEBKGND, WS_POPUP, WS_VISIBLE, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, IsWindow, PostMessageW, PostQuitMessage, RegisterClassW,
+    SetCursor, SetCursorPos, SetWindowLongPtrW, SetWindowPos, ShowCursor, ShowWindow,
+    TranslateMessage, CREATESTRUCTW, GWLP_USERDATA, HCURSOR, HMENU, HWND_TOPMOST, MSG,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNA, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_NCCREATE,
+    WM_PAINT, WM_SETCURSOR, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_VISIBLE,
 };
 
-const CAPTURE_WIDTH: u16 = 960;
-const CAPTURE_HEIGHT: u16 = 540;
-const CAPTURE_FPS: u32 = 30;
+const VIEWER_CLASS: PCWSTR = windows::core::w!("DuplexKvmDisplayViewer");
+/// Above this many changed regions, invalidate the whole window instead.
+const MAX_INVALIDATE_RECTS: usize = 64;
 
-struct MonitorEntry {
-    rect: RECT,
-    is_primary: bool,
-}
-
-unsafe extern "system" fn monitor_enum_proc(
-    hmonitor: HMONITOR,
-    _hdc: HDC,
-    _lprc: *mut RECT,
-    dwdata: LPARAM,
-) -> BOOL {
-    let list = &mut *(dwdata.0 as *mut Vec<MonitorEntry>);
-    let mut mi = MONITORINFO {
-        cbSize: size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if GetMonitorInfoW(hmonitor, &mut mi).as_bool() {
-        let is_primary = (mi.dwFlags & 1) != 0;
-        list.push(MonitorEntry {
-            rect: mi.rcMonitor,
-            is_primary,
-        });
-    }
-    BOOL(1)
-}
-
-/// Enumerates all attached display monitor rectangles on Windows, ordered with the primary monitor first
-/// followed by secondary/extended monitors sorted left-to-right.
 fn enumerate_monitor_rects() -> Vec<RECT> {
-    let mut entries: Vec<MonitorEntry> = Vec::new();
-    unsafe {
-        let _ = EnumDisplayMonitors(
-            HDC::default(),
-            None,
-            Some(monitor_enum_proc),
-            LPARAM(&mut entries as *mut Vec<MonitorEntry> as isize),
-        );
-    }
-    entries.sort_by_key(|e| (!e.is_primary, e.rect.left));
-    if entries.is_empty() {
-        vec![RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        }]
-    } else {
-        entries.into_iter().map(|e| e.rect).collect()
-    }
+    super::display::physical_monitor_rects()
 }
 
-struct WinEncoderWorker {
-    monitor_index: u8,
-    stop_flag: Arc<AtomicBool>,
-    force_idr_flag: Arc<AtomicBool>,
-    join_handle: Option<JoinHandle<()>>,
-}
-
-struct SharedViewerCanvas {
-    bgrx: Vec<u8>,
+/// Latest presented frame, shared by a decoder thread and a window thread.
+#[derive(Default)]
+struct FrontBuffer {
+    pixels: Vec<u8>,
     width: u16,
     height: u16,
-    dirty: bool,
 }
 
-struct WinViewerHandle {
-    monitor_index: u8,
-    stop_flag: Arc<AtomicBool>,
-    canvas: Arc<Mutex<SharedViewerCanvas>>,
-    join_handle: Option<JoinHandle<()>>,
+struct ViewerWindowState {
+    front: Mutex<FrontBuffer>,
+    alive: AtomicBool,
+}
+
+unsafe fn window_state<'a>(hwnd: HWND) -> Option<&'a ViewerWindowState> {
+    let pointer = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const ViewerWindowState;
+    pointer.as_ref()
+}
+
+unsafe fn paint(hwnd: HWND) {
+    let mut paint = PAINTSTRUCT::default();
+    let dc = BeginPaint(hwnd, &mut paint);
+    let mut client = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client);
+    let black = HBRUSH(GetStockObject(BLACK_BRUSH).0);
+    let front = window_state(hwnd).and_then(|state| state.front.lock().ok());
+    match front.as_deref() {
+        Some(front) if front.width > 0 && front.height > 0 => {
+            let (fw, fh) = (i32::from(front.width), i32::from(front.height));
+            let (cw, ch) = (client.right - client.left, client.bottom - client.top);
+            let (dw, dh) = if (fw, fh) == (cw, ch) {
+                (fw, fh)
+            } else {
+                // Preserve the aspect ratio; letterbox the remainder.
+                let scale = (f64::from(cw) / f64::from(fw)).min(f64::from(ch) / f64::from(fh));
+                (
+                    (f64::from(fw) * scale).round() as i32,
+                    (f64::from(fh) * scale).round() as i32,
+                )
+            };
+            let (dx, dy) = ((cw - dw) / 2, (ch - dh) / 2);
+            for border in [
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: cw,
+                    bottom: dy,
+                },
+                RECT {
+                    left: 0,
+                    top: dy + dh,
+                    right: cw,
+                    bottom: ch,
+                },
+                RECT {
+                    left: 0,
+                    top: dy,
+                    right: dx,
+                    bottom: dy + dh,
+                },
+                RECT {
+                    left: dx + dw,
+                    top: dy,
+                    right: cw,
+                    bottom: dy + dh,
+                },
+            ] {
+                if border.right > border.left && border.bottom > border.top {
+                    FillRect(dc, &border, black);
+                }
+            }
+            if (dw, dh) == (fw, fh) {
+                SetStretchBltMode(dc, COLORONCOLOR);
+            } else {
+                SetStretchBltMode(dc, HALFTONE);
+                let _ = SetBrushOrgEx(dc, 0, 0, None);
+            }
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: fw,
+                    biHeight: -fh,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            // BeginPaint clipped the DC to the invalid region, so only
+            // changed areas are actually transferred.
+            StretchDIBits(
+                dc,
+                dx,
+                dy,
+                dw,
+                dh,
+                0,
+                0,
+                fw,
+                fh,
+                Some(front.pixels.as_ptr().cast::<c_void>()),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+        }
+        _ => {
+            FillRect(dc, &client, black);
+        }
+    }
+    drop(front);
+    let _ = EndPaint(hwnd, &paint);
 }
 
 unsafe extern "system" fn viewer_wnd_proc(
@@ -122,16 +171,253 @@ unsafe extern "system" fn viewer_wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     match msg {
+        WM_NCCREATE => {
+            let create = &*(lparam.0 as *const CREATESTRUCTW);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_SETCURSOR => {
+            SetCursor(HCURSOR::default());
+            LRESULT(1)
+        }
         WM_ERASEBKGND => LRESULT(1),
+        WM_PAINT => {
+            paint(hwnd);
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            let _ = DestroyWindow(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
 }
 
+struct ViewerWindow {
+    hwnd: isize,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ViewerWindow {
+    fn close(mut self) {
+        unsafe {
+            let _ = PostMessageW(
+                HWND(self.hwnd as *mut c_void),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Creates a viewer window covering `rect` on its own message thread.
+fn open_viewer_window(
+    monitor: u8,
+    rect: RECT,
+) -> Result<(ViewerWindow, Arc<ViewerWindowState>), PalError> {
+    let state = Arc::new(ViewerWindowState {
+        front: Mutex::new(FrontBuffer::default()),
+        alive: AtomicBool::new(true),
+    });
+    let thread_state = state.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<isize, String>>(1);
+    let thread = thread::Builder::new()
+        .name(format!("duplex-viewer-{monitor}"))
+        .spawn(move || unsafe {
+            let instance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(viewer_wnd_proc),
+                hInstance: instance,
+                lpszClassName: VIEWER_CLASS,
+                ..Default::default()
+            };
+            // A second viewer finds the class already registered.
+            RegisterClassW(&class);
+            let title: Vec<u16> = format!("Duplex — laptop display {}\0", monitor + 1)
+                .encode_utf16()
+                .collect();
+            let (width, height) = (
+                (rect.right - rect.left).max(64),
+                (rect.bottom - rect.top).max(64),
+            );
+            let created = CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                VIEWER_CLASS,
+                PCWSTR(title.as_ptr()),
+                WS_POPUP | WS_VISIBLE,
+                rect.left,
+                rect.top,
+                width,
+                height,
+                HWND::default(),
+                HMENU::default(),
+                instance,
+                Some(Arc::as_ptr(&thread_state).cast::<c_void>()),
+            );
+            let hwnd = match created {
+                Ok(hwnd) if !hwnd.0.is_null() => hwnd,
+                Ok(_) => {
+                    thread_state.alive.store(false, Ordering::Release);
+                    let _ = ready_tx.send(Err("CreateWindowExW returned no window".into()));
+                    return;
+                }
+                Err(error) => {
+                    thread_state.alive.store(false, Ordering::Release);
+                    let _ = ready_tx.send(Err(format!("CreateWindowExW failed: {error}")));
+                    return;
+                }
+            };
+            let _ = ShowWindow(hwnd, SW_SHOWNA);
+            let _ = SetWindowPos(
+                hwnd,
+                HWND_TOPMOST,
+                rect.left,
+                rect.top,
+                width,
+                height,
+                SWP_SHOWWINDOW | SWP_NOACTIVATE,
+            );
+            // Hide the frozen local cursor while it rests over this thread's windows.
+            ShowCursor(false);
+            let _ = ready_tx.send(Ok(hwnd.0 as isize));
+            let mut message = MSG::default();
+            while GetMessageW(&mut message, HWND::default(), 0, 0).0 > 0 {
+                let _ = TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if IsWindow(hwnd).as_bool() {
+                let _ = DestroyWindow(hwnd);
+            }
+            thread_state.alive.store(false, Ordering::Release);
+        })
+        .map_err(|e| PalError::VideoPipeline(format!("Cannot start viewer window thread: {e}")))?;
+    match ready_rx.recv_timeout(Duration::from_secs(3)) {
+        Ok(Ok(hwnd)) => Ok((
+            ViewerWindow {
+                hwnd,
+                thread: Some(thread),
+            },
+            state,
+        )),
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            Err(PalError::VideoPipeline(error))
+        }
+        Err(_) => Err(PalError::VideoPipeline(
+            "Viewer window startup timed out".into(),
+        )),
+    }
+}
+
+/// Decoder-side handle that updates a viewer window's front buffer.
+struct WindowPresenter {
+    monitor: u8,
+    hwnd: isize,
+    client: (i32, i32),
+    state: Arc<ViewerWindowState>,
+}
+
+impl FramePresenter for WindowPresenter {
+    fn present(
+        &mut self,
+        width: u16,
+        height: u16,
+        canvas: &[u8],
+        dirty: &[PixelRect],
+    ) -> Result<(), PalError> {
+        if !self.state.alive.load(Ordering::Acquire) {
+            return Err(PalError::VideoPipeline(format!(
+                "Viewer window {} closed",
+                self.monitor
+            )));
+        }
+        let stride = usize::from(width) * 4;
+        let length = stride * usize::from(height);
+        if canvas.len() < length {
+            return Err(PalError::VideoPipeline(
+                "Decoded frame is smaller than its size".into(),
+            ));
+        }
+        let resized = {
+            let mut front = self
+                .state
+                .front
+                .lock()
+                .map_err(|_| PalError::VideoPipeline("Viewer frame lock poisoned".into()))?;
+            let resized = (front.width, front.height) != (width, height);
+            if resized {
+                front.pixels.clear();
+                front.pixels.extend_from_slice(&canvas[..length]);
+                (front.width, front.height) = (width, height);
+            } else {
+                for rect in dirty {
+                    let (x, w) = (rect.x as usize * 4, rect.width as usize * 4);
+                    for row in rect.y as usize..(rect.y + rect.height) as usize {
+                        let at = row * stride + x;
+                        front.pixels[at..at + w].copy_from_slice(&canvas[at..at + w]);
+                    }
+                }
+            }
+            resized
+        };
+        let hwnd = HWND(self.hwnd as *mut c_void);
+        let one_to_one = self.client == (i32::from(width), i32::from(height));
+        unsafe {
+            if resized || !one_to_one || dirty.len() > MAX_INVALIDATE_RECTS {
+                let _ = InvalidateRect(hwnd, None, false);
+            } else {
+                for rect in dirty {
+                    let area = RECT {
+                        left: rect.x as i32,
+                        top: rect.y as i32,
+                        right: (rect.x + rect.width) as i32,
+                        bottom: (rect.y + rect.height) as i32,
+                    };
+                    let _ = InvalidateRect(hwnd, Some(&area), false);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct WinSender {
+    monitor: u8,
+    control: Arc<EncoderControl>,
+    capture_stop: Arc<AtomicBool>,
+    capture_failure: Arc<Mutex<Option<String>>>,
+    capture: Option<JoinHandle<()>>,
+    encoder: Option<JoinHandle<()>>,
+    reported: bool,
+}
+
+impl WinSender {
+    fn stop(mut self) {
+        self.control.stop();
+        self.capture_stop.store(true, Ordering::Release);
+        for handle in [self.capture.take(), self.encoder.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 pub struct WindowsVideoPipelineBackend {
-    encoders: Vec<WinEncoderWorker>,
-    frame_rx: Option<Receiver<EncodedVideoFrame>>,
-    viewers: Vec<WinViewerHandle>,
-    last_cursor_pos: (i32, i32),
+    caps: PeerVideoCaps,
+    senders: Vec<WinSender>,
+    viewers: Option<ViewerSet>,
+    windows: Vec<ViewerWindow>,
 }
 
 impl Default for WindowsVideoPipelineBackend {
@@ -143,483 +429,353 @@ impl Default for WindowsVideoPipelineBackend {
 impl WindowsVideoPipelineBackend {
     pub const fn new() -> Self {
         Self {
-            encoders: Vec::new(),
-            frame_rx: None,
-            viewers: Vec::new(),
-            last_cursor_pos: (0, 0),
+            caps: PeerVideoCaps {
+                native_lossless: false,
+                tiles: false,
+            },
+            senders: Vec::new(),
+            viewers: None,
+            windows: Vec::new(),
         }
     }
 
-    fn spawn_gdi_encoder_thread(
-        spec: DisplayDescriptor,
-        tx: SyncSender<EncodedVideoFrame>,
-    ) -> WinEncoderWorker {
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let force_idr_flag = Arc::new(AtomicBool::new(true));
-
-        let stop_clone = stop_flag.clone();
-        let idr_clone = force_idr_flag.clone();
-        let monitor_index = spec.index;
-
-        let join_handle = thread::Builder::new()
-            .name(format!("duplex-win-gdi-enc-{monitor_index}"))
-            .spawn(move || unsafe {
-                let mut frame_seq = 0u32;
-                let frame_interval = Duration::from_millis(1000 / u64::from(CAPTURE_FPS));
-                let cap_w = CAPTURE_WIDTH as i32;
-                let cap_h = CAPTURE_HEIGHT as i32;
-                let raw_frame_len = (cap_w as usize) * (cap_h as usize) * 4;
-                let mut prev_rgb565: Vec<u16> = Vec::new();
-                let mut cycle_counter: u32 = 0;
-                let mut last_force_all_ns: u64 = 0;
-                let mut encoded_batch: Vec<EncodedVideoFrame> = Vec::with_capacity(32);
-
-                let screen_dc = GetDC(HWND::default());
-                let mem_dc = CreateCompatibleDC(screen_dc);
-                let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
-
-                let bmi = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: cap_w,
-                        biHeight: -cap_h, // Top-down BGRx DIB
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB.0,
-                        biSizeImage: raw_frame_len as u32,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-
-                let mut bits_ptr: *mut c_void = ptr::null_mut();
-                let hbmp_res =
-                    CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0);
-                let hbmp = hbmp_res.unwrap_or_default();
-                let old_obj = if !hbmp.is_invalid() {
-                    SelectObject(mem_dc, HGDIOBJ(hbmp.0))
-                } else {
-                    HGDIOBJ::default()
-                };
-
-                let mut raw_buf = vec![0u8; raw_frame_len];
-
-                while !stop_clone.load(Ordering::Relaxed) {
-                    let rects = enumerate_monitor_rects();
-                    // In Mode 1+ (extend display), stream the secondary/extended monitor if 2+ monitors exist,
-                    // or the primary monitor if only 1 monitor is present.
-                    let target_rect = if rects.len() >= 2 {
-                        rects[(monitor_index as usize + 1).min(rects.len() - 1)]
-                    } else {
-                        rects[0]
-                    };
-                    let src_x = target_rect.left;
-                    let src_y = target_rect.top;
-                    let src_w = (target_rect.right - target_rect.left).max(64);
-                    let src_h = (target_rect.bottom - target_rect.top).max(64);
-
-                    if !bits_ptr.is_null() {
-                        let _ = StretchBlt(
-                            mem_dc,
-                            0,
-                            0,
-                            cap_w,
-                            cap_h,
-                            screen_dc,
-                            src_x,
-                            src_y,
-                            src_w,
-                            src_h,
-                            SRCCOPY,
-                        );
-                        ptr::copy_nonoverlapping(
-                            bits_ptr as *const u8,
-                            raw_buf.as_mut_ptr(),
-                            raw_frame_len,
-                        );
-
-                        // Overlay hardware cursor position onto the captured BGRx canvas
-                        let mut pt = POINT::default();
-                        if GetCursorPos(&mut pt).is_ok()
-                            && pt.x >= src_x
-                            && pt.x < src_x + src_w
-                            && pt.y >= src_y
-                            && pt.y < src_y + src_h
-                        {
-                            let cx = ((pt.x - src_x) * cap_w / src_w).clamp(0, cap_w - 1);
-                            let cy = ((pt.y - src_y) * cap_h / src_h).clamp(0, cap_h - 1);
-                            for dy in -5i32..=5i32 {
-                                for dx in -5i32..=5i32 {
-                                    let px = cx + dx;
-                                    let py = cy + dy;
-                                    if px >= 0 && px < cap_w && py >= 0 && py < cap_h {
-                                        let off = ((py as usize) * (cap_w as usize) + (px as usize)) * 4;
-                                        let is_border =
-                                            dx.abs() == 5 || dy.abs() == 5 || (dx == 0 && dy == 0);
-                                        let c = if is_border { 0x00u8 } else { 0xFFu8 };
-                                        raw_buf[off] = c;
-                                        raw_buf[off + 1] = c;
-                                        raw_buf[off + 2] = c;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let now_ns = monotonic_now_ns();
-                    let req_idr = idr_clone.swap(false, Ordering::AcqRel);
-                    let force_all =
-                        req_idr && now_ns.saturating_sub(last_force_all_ns) >= 500_000_000;
-                    if force_all {
-                        last_force_all_ns = now_ns;
-                    }
-
-                    encoded_batch.clear();
-                    encode_bgrx_frame_to_bands(
-                        monitor_index,
-                        CAPTURE_WIDTH,
-                        CAPTURE_HEIGHT,
-                        &raw_buf,
-                        &mut prev_rgb565,
-                        force_all,
-                        cycle_counter,
-                        &mut frame_seq,
-                        now_ns,
-                        &mut encoded_batch,
-                    );
-                    cycle_counter = cycle_counter.wrapping_add(1);
-
-                    let band_count = encoded_batch.len();
-                    for frame in encoded_batch.drain(..) {
-                        let _ = tx.send(frame);
-                        if band_count > 6 {
-                            thread::sleep(Duration::from_micros(150));
-                        }
-                    }
-
-                    thread::sleep(frame_interval);
-                }
-
-                if !old_obj.is_invalid() {
-                    let _ = SelectObject(mem_dc, old_obj);
-                }
-                if !hbmp.is_invalid() {
-                    let _ = DeleteObject(HGDIOBJ(hbmp.0));
-                }
-                let _ = DeleteDC(mem_dc);
-                let _ = ReleaseDC(HWND::default(), screen_dc);
-            })
-            .expect("Failed to spawn Windows GDI screen capture thread");
-
-        WinEncoderWorker {
-            monitor_index,
-            stop_flag,
-            force_idr_flag,
-            join_handle: Some(join_handle),
-        }
-    }
-
-    fn spawn_win32_viewer_thread(monitor_index: u8, target_rect: RECT) -> WinViewerHandle {
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_clone = stop_flag.clone();
-        let canvas = Arc::new(Mutex::new(SharedViewerCanvas {
-            bgrx: vec![0u8; (CAPTURE_WIDTH as usize) * (CAPTURE_HEIGHT as usize) * 4],
-            width: CAPTURE_WIDTH,
-            height: CAPTURE_HEIGHT,
-            dirty: true,
-        }));
-        let canvas_clone = canvas.clone();
-
-        let join_handle = thread::Builder::new()
-            .name(format!("duplex-win-viewer-{monitor_index}"))
-            .spawn(move || unsafe {
-                let hinstance: HINSTANCE = GetModuleHandleW(None).unwrap_or_default().into();
-                let class_name: Vec<u16> = "DuplexKvmFullscreenViewerClass\0"
-                    .encode_utf16()
-                    .collect();
-                let wc = WNDCLASSW {
-                    lpfnWndProc: Some(viewer_wnd_proc),
-                    hInstance: hinstance,
-                    lpszClassName: PCWSTR(class_name.as_ptr()),
-                    hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-                    ..Default::default()
-                };
-                let _ = RegisterClassW(&wc);
-
-                let title: Vec<u16> = format!(
-                    "Duplex-KVM — Debian Laptop Display {} (Mode 2)\0",
-                    monitor_index + 1
-                )
-                .encode_utf16()
-                .collect();
-
-                let win_x = target_rect.left;
-                let win_y = target_rect.top;
-                let win_w = (target_rect.right - target_rect.left).max(640);
-                let win_h = (target_rect.bottom - target_rect.top).max(480);
-
-                let hwnd = CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    PCWSTR(class_name.as_ptr()),
-                    PCWSTR(title.as_ptr()),
-                    WS_POPUP | WS_VISIBLE,
-                    win_x,
-                    win_y,
-                    win_w,
-                    win_h,
-                    HWND::default(),
-                    HMENU::default(),
-                    hinstance,
-                    None,
-                )
-                .unwrap_or_default();
-
-                if !hwnd.0.is_null() {
-                    let _ = ShowWindow(hwnd, SW_SHOW);
-                }
-
-                let mut msg = MSG::default();
-                let mut local_bgrx: Vec<u8> = Vec::new();
-
-                while !stop_clone.load(Ordering::Relaxed) {
-                    while PeekMessageW(&mut msg, HWND::default(), 0, 0, PM_REMOVE).as_bool() {
-                        if msg.message == WM_CLOSE {
-                            stop_clone.store(true, Ordering::Release);
-                            break;
-                        }
-                        let _ = TranslateMessage(&msg);
-                        DispatchMessageW(&msg);
-                    }
-
-                    let mut frame_dims: Option<(u16, u16)> = None;
-                    if let Ok(mut guard) = canvas_clone.lock() {
-                        if guard.dirty {
-                            guard.dirty = false;
-                            local_bgrx.resize(guard.bgrx.len(), 0);
-                            local_bgrx.copy_from_slice(&guard.bgrx);
-                            frame_dims = Some((guard.width, guard.height));
-                        }
-                    }
-
-                    if let Some((fw, fh)) = frame_dims {
-                        if !hwnd.0.is_null() && fw > 0 && fh > 0 {
-                            let hdc = GetDC(hwnd);
-                            let _ = SetStretchBltMode(hdc, COLORONCOLOR);
-                            let bmi = BITMAPINFO {
-                                bmiHeader: BITMAPINFOHEADER {
-                                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                                    biWidth: i32::from(fw),
-                                    biHeight: -i32::from(fh), // Top-down BGRx
-                                    biPlanes: 1,
-                                    biBitCount: 32,
-                                    biCompression: BI_RGB.0,
-                                    biSizeImage: (fw as u32) * (fh as u32) * 4,
-                                    ..Default::default()
-                                },
-                                ..Default::default()
-                            };
-                            let _ = StretchDIBits(
-                                hdc,
-                                0,
-                                0,
-                                win_w,
-                                win_h,
-                                0,
-                                0,
-                                i32::from(fw),
-                                i32::from(fh),
-                                Some(local_bgrx.as_ptr() as *const c_void),
-                                &bmi,
-                                DIB_RGB_COLORS,
-                                SRCCOPY,
-                            );
-                            let _ = ReleaseDC(hwnd, hdc);
-                        }
-                    }
-
-                    thread::sleep(Duration::from_millis(8));
-                }
-
-                if !hwnd.0.is_null() {
-                    let _ = DestroyWindow(hwnd);
-                }
-            })
-            .expect("Failed to spawn Windows fullscreen viewer thread");
-
-        WinViewerHandle {
-            monitor_index,
-            stop_flag,
-            canvas,
-            join_handle: Some(join_handle),
+    fn start_stream(
+        &mut self,
+        spec: &DisplayDescriptor,
+        device: String,
+        rect: RECT,
+        sink: Arc<dyn VideoSink>,
+    ) -> Result<(), PalError> {
+        let width = spec.width_px.clamp(16, 7680) as u16;
+        let height = spec.height_px.clamp(16, 4320) as u16;
+        let slot = FrameSlot::new();
+        let capture_stop = Arc::new(AtomicBool::new(false));
+        let capture_failure = Arc::new(Mutex::new(None));
+        let target = CaptureTarget {
+            monitor: spec.index,
+            device,
+            rect,
+            width,
+            height,
+        };
+        let capture = spawn_capture(
+            target,
+            slot.clone(),
+            capture_stop.clone(),
+            capture_failure.clone(),
+        )
+        .map_err(|e| PalError::VideoPipeline(format!("Cannot start desktop capture: {e}")))?;
+        let control = EncoderControl::new(StreamCodec::for_peer(self.caps));
+        let mut sender = WinSender {
+            monitor: spec.index,
+            control: control.clone(),
+            capture_stop,
+            capture_failure,
+            capture: Some(capture),
+            encoder: None,
+            reported: false,
+        };
+        match spawn_encoder(
+            EncoderSpec {
+                monitor: spec.index,
+                width,
+                height,
+            },
+            slot,
+            sink,
+            control,
+            encoder_config_from_env(),
+        ) {
+            Ok(encoder) => {
+                sender.encoder = Some(encoder);
+                self.senders.push(sender);
+                Ok(())
+            }
+            Err(error) => {
+                sender.stop();
+                Err(error)
+            }
         }
     }
 }
 
 impl VideoPipelineBackend for WindowsVideoPipelineBackend {
+    fn set_peer_video_caps(&mut self, caps: PeerVideoCaps) {
+        if self.caps != caps {
+            info!(?caps, "Peer video capabilities changed");
+        }
+        self.caps = caps;
+        for sender in &self.senders {
+            sender.control.set_codec(StreamCodec::for_peer(caps));
+        }
+    }
+
     fn start_sender(
         &mut self,
         monitors: &[DisplayDescriptor],
-        max_bitrate_kbps: u32,
+        sink: Arc<dyn VideoSink>,
     ) -> Result<(), PalError> {
         self.close_all_viewer_windows()?;
         if monitors.is_empty() {
             return Ok(());
         }
-
-        let capped_bitrate = max_bitrate_kbps.min(MAX_VIDEO_BITRATE_KBPS);
-        let (tx, rx) = mpsc::sync_channel::<EncodedVideoFrame>(64);
-        self.frame_rx = Some(rx);
-
-        for spec in monitors {
-            let worker = Self::spawn_gdi_encoder_thread(spec.clone(), tx.clone());
-            self.encoders.push(worker);
+        let targets = super::display::attached_virtual_outputs();
+        if targets.len() < monitors.len() {
+            return Err(PalError::VideoPipeline("Mode 1+ requires a real attached virtual display; existing physical monitors are not capture substitutes.".into()));
         }
-
-        info!(
-            streams = self.encoders.len(),
-            bitrate_kbps = capped_bitrate,
-            "Started Windows 11 built-in GDI screen capture + DPXB band video sender"
-        );
+        for (spec, (device, rect)) in monitors.iter().zip(targets) {
+            if let Err(error) = self.start_stream(spec, device, rect, sink.clone()) {
+                let _ = self.close_all_viewer_windows();
+                return Err(error);
+            }
+        }
+        info!(streams = self.senders.len(), codec = ?StreamCodec::for_peer(self.caps), "Started Windows virtual-display streaming");
         Ok(())
-    }
-
-    fn poll_encoded_frames(
-        &mut self,
-        out_frames: &mut Vec<EncodedVideoFrame>,
-        out_cursor: &mut Option<CursorTelemetry>,
-    ) -> Result<usize, PalError> {
-        let mut count = 0usize;
-        if let Some(ref rx) = self.frame_rx {
-            while count < 32 {
-                match rx.try_recv() {
-                    Ok(frame) => {
-                        out_frames.push(frame);
-                        count += 1;
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if !self.encoders.is_empty() {
-            let mut pt = POINT::default();
-            if unsafe { GetCursorPos(&mut pt).is_ok() } && (pt.x, pt.y) != self.last_cursor_pos {
-                self.last_cursor_pos = (pt.x, pt.y);
-                *out_cursor = Some(CursorTelemetry {
-                    monitor_index: 0,
-                    x: pt.x,
-                    y: pt.y,
-                    visible: true,
-                    shape: None,
-                });
-            } else {
-                *out_cursor = None;
-            }
-        } else {
-            *out_cursor = None;
-        }
-
-        Ok(count)
     }
 
     fn request_keyframe(&mut self, monitor_index: u8) -> Result<(), PalError> {
-        for enc in &self.encoders {
-            if enc.monitor_index == monitor_index {
-                enc.force_idr_flag.store(true, Ordering::Release);
-                debug!(
-                    monitor_index,
-                    "Scheduled immediate Windows full-frame DPXB refresh"
-                );
-            }
+        for sender in self.senders.iter().filter(|s| s.monitor == monitor_index) {
+            sender.control.request_refresh();
         }
         Ok(())
     }
 
-    fn start_viewer(&mut self, monitors: &[DisplayDescriptor]) -> Result<(), PalError> {
+    fn start_viewer(
+        &mut self,
+        monitors: &[DisplayDescriptor],
+    ) -> Result<Arc<dyn VideoFrameConsumer>, PalError> {
         self.close_all_viewer_windows()?;
-
         let rects = enumerate_monitor_rects();
+        if rects.is_empty() {
+            return Err(PalError::VideoPipeline(
+                "No physical Windows viewer monitors are attached.".into(),
+            ));
+        }
+        let mut presenters: Vec<(u8, Box<dyn FramePresenter>)> = Vec::new();
         for spec in monitors {
-            let idx = spec.index as usize;
-            let target_rect = if idx < rects.len() {
-                rects[idx]
-            } else {
-                // If fewer physical monitors exist than requested streams, tile on primary monitor
+            let index = usize::from(spec.index);
+            let target = rects.get(index).copied().unwrap_or_else(|| {
+                // Fewer physical monitors than streams: tile on the primary monitor.
                 let primary = rects[0];
-                let pw = (primary.right - primary.left) / 2;
+                let half = (primary.right - primary.left) / 2;
+                let column = (index % 2) as i32;
                 RECT {
-                    left: primary.left + (idx as i32 % 2) * pw,
+                    left: primary.left + column * half,
                     top: primary.top,
-                    right: primary.left + ((idx as i32 % 2) + 1) * pw,
+                    right: primary.left + (column + 1) * half,
                     bottom: primary.bottom,
                 }
-            };
-            let handle = Self::spawn_win32_viewer_thread(spec.index, target_rect);
-            self.viewers.push(handle);
-        }
-
-        info!(
-            requested_viewers = monitors.len(),
-            spawned_windows = self.viewers.len(),
-            "Initialized Windows 11 native borderless fullscreen viewer windows for Mode 2"
-        );
-        Ok(())
-    }
-
-    fn submit_encoded_frame(&mut self, frame: &EncodedVideoFrame) -> Result<(), PalError> {
-        if frame.data.len() < 12 || frame.data[0..4] != DPXB_BAND_MAGIC {
-            return Ok(());
-        }
-
-        for viewer in &mut self.viewers {
-            if viewer.monitor_index == frame.monitor_index {
-                if let Ok(mut guard) = viewer.canvas.lock() {
-                    let mut w = guard.width;
-                    let mut h = guard.height;
-                    if decode_band_into_bgrx(&frame.data, &mut w, &mut h, &mut guard.bgrx) {
-                        guard.width = w;
-                        guard.height = h;
-                        guard.dirty = true;
-                    }
+            });
+            match open_viewer_window(spec.index, target) {
+                Ok((window, state)) => {
+                    presenters.push((
+                        spec.index,
+                        Box::new(WindowPresenter {
+                            monitor: spec.index,
+                            hwnd: window.hwnd,
+                            client: (target.right - target.left, target.bottom - target.top),
+                            state,
+                        }),
+                    ));
+                    self.windows.push(window);
+                }
+                Err(error) => {
+                    let _ = self.close_all_viewer_windows();
+                    return Err(error);
                 }
             }
         }
-        Ok(())
+        // An injected no-op move makes Windows ask the window under the
+        // frozen cursor for its (empty) cursor image.
+        unsafe {
+            let mut position = POINT::default();
+            if GetCursorPos(&mut position).is_ok() {
+                let _ = SetCursorPos(position.x, position.y);
+            }
+        }
+        let (viewers, consumer) = match ViewerSet::spawn(presenters) {
+            Ok(spawned) => spawned,
+            Err(error) => {
+                let _ = self.close_all_viewer_windows();
+                return Err(error);
+            }
+        };
+        self.viewers = Some(viewers);
+        info!(
+            viewers = self.windows.len(),
+            "Opened Windows fullscreen display viewers"
+        );
+        Ok(consumer)
     }
 
-    fn update_hardware_cursor(&mut self, cursor: &CursorTelemetry) -> Result<(), PalError> {
-        if cursor.visible {
-            let x_offset = i32::from(cursor.monitor_index) * 1920;
-            unsafe {
-                let _ = SetCursorPos(x_offset + cursor.x, cursor.y);
+    fn poll_health(&mut self, refresh_requests: &mut Vec<u8>) -> Result<(), PalError> {
+        if let Some(viewers) = &self.viewers {
+            viewers.take_refresh_requests(refresh_requests);
+            if let Some(failure) = viewers.failure() {
+                return Err(PalError::VideoPipeline(failure));
+            }
+        }
+        for sender in &mut self.senders {
+            if sender.reported || !sender.control.finished() {
+                continue;
+            }
+            sender.reported = true;
+            if let Some(failure) = sender.capture_failure.lock().ok().and_then(|f| f.clone()) {
+                return Err(PalError::VideoPipeline(format!(
+                    "Desktop capture for display {} stopped: {failure}",
+                    sender.monitor + 1
+                )));
             }
         }
         Ok(())
     }
 
     fn close_all_viewer_windows(&mut self) -> Result<(), PalError> {
-        for mut enc in self.encoders.drain(..) {
-            enc.stop_flag.store(true, Ordering::Release);
-            if let Some(handle) = enc.join_handle.take() {
-                let _ = handle.join();
-            }
+        for sender in self.senders.drain(..) {
+            sender.stop();
         }
-        self.frame_rx = None;
-
-        for mut viewer in self.viewers.drain(..) {
-            viewer.stop_flag.store(true, Ordering::Release);
-            if let Some(handle) = viewer.join_handle.take() {
-                let _ = handle.join();
-            }
+        if let Some(viewers) = self.viewers.take() {
+            viewers.stop();
         }
-
-        info!("Closed all Windows GDI encoders and borderless fullscreen viewer windows");
+        for window in self.windows.drain(..) {
+            window.close();
+        }
         Ok(())
     }
 }
 
 impl Drop for WindowsVideoPipelineBackend {
     fn drop(&mut self) {
-        let _ = self.close_all_viewer_windows();
+        if let Err(error) = self.close_all_viewer_windows() {
+            warn!(%error, "Video teardown failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stream::SlotWait;
+    use duplex_proto::{TileEncoder, TileEncoderConfig};
+    use std::time::Instant;
+
+    fn pattern(width: usize, height: usize) -> Vec<u8> {
+        let mut frame = vec![0u8; width * height * 4];
+        for (i, pixel) in frame.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % width, i / width);
+            let colour = match (x * 2 / width, y * 2 / height) {
+                (0, 0) => [0, 0, 255, 255],
+                (1, 0) => [0, 255, 0, 255],
+                (0, _) => [255, 0, 0, 255],
+                _ => {
+                    // Single-pixel checkerboard: any resampling would blur it.
+                    let on = (x + y) % 2 == 0;
+                    if on {
+                        [255, 255, 255, 255]
+                    } else {
+                        [16, 16, 16, 255]
+                    }
+                }
+            };
+            *pixel = colour;
+        }
+        frame
+    }
+
+    /// Opens a fullscreen viewer, streams a pattern through the decoder, then
+    /// captures the screen (DXGI, or GDI where duplication is unavailable)
+    /// and requires pixel-exact output.
+    #[test]
+    #[ignore = "opens windows; run on a Windows desktop or under Wine (xvfb-run wine)"]
+    fn viewer_presents_exact_pixels_and_capture_reads_them_back() {
+        let rects = enumerate_monitor_rects();
+        let primary = *rects.first().expect("a monitor");
+        let (width, height) = (
+            (primary.right - primary.left) as u16,
+            (primary.bottom - primary.top) as u16,
+        );
+        let spec = DisplayDescriptor {
+            index: 0,
+            width_px: u32::from(width),
+            height_px: u32::from(height),
+            refresh_hz: 60,
+            scale_percent: 100,
+            physical_width_mm: 500,
+            physical_height_mm: 300,
+            edid_block: DisplayDescriptor::synthesize_edid(
+                u32::from(width),
+                u32::from(height),
+                60,
+                0,
+            ),
+        };
+        let mut backend = WindowsVideoPipelineBackend::new();
+        let consumer = backend.start_viewer(&[spec]).unwrap();
+        let frame = pattern(width.into(), height.into());
+        let cfg = TileEncoderConfig {
+            lossless_only: true,
+            ..Default::default()
+        };
+        let mut encoder = TileEncoder::new(0, width, height, cfg, 77);
+        let mut units = Vec::new();
+        encoder.encode_frame(&frame, 1, &mut units);
+        for unit in units {
+            consumer.submit(unit);
+        }
+        thread::sleep(Duration::from_millis(1500));
+        let mut refresh = Vec::new();
+        backend.poll_health(&mut refresh).unwrap();
+        assert!(refresh.is_empty(), "no loss expected: {refresh:?}");
+
+        let slot = FrameSlot::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let target = CaptureTarget {
+            monitor: 0,
+            device: r"\\.\DISPLAY1".into(),
+            rect: primary,
+            width,
+            height,
+        };
+        let capture = spawn_capture(target, slot.clone(), stop.clone(), failure.clone()).unwrap();
+        let started = Instant::now();
+        let captured = loop {
+            match slot.wait(Duration::from_millis(200)) {
+                SlotWait::Frame(captured) => break captured,
+                _ => assert!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "no captured frame"
+                ),
+            }
+        };
+        stop.store(true, Ordering::Release);
+        capture.join().unwrap();
+        assert!(failure.lock().unwrap().is_none());
+        assert_eq!(captured.len(), frame.len());
+        // Compare every pixel except a square around the composited cursor.
+        let mut cursor = POINT::default();
+        unsafe {
+            let _ = GetCursorPos(&mut cursor);
+        }
+        let (w, h) = (usize::from(width), usize::from(height));
+        let mut mismatched = 0usize;
+        let mut compared = 0usize;
+        for y in 0..h {
+            for x in 0..w {
+                let near_cursor = (x as i32 - (cursor.x - primary.left)).abs() < 300
+                    && (y as i32 - (cursor.y - primary.top)).abs() < 300;
+                if near_cursor {
+                    continue;
+                }
+                let i = (y * w + x) * 4;
+                compared += 1;
+                if captured[i..i + 3] != frame[i..i + 3] {
+                    mismatched += 1;
+                }
+            }
+        }
+        backend.close_all_viewer_windows().unwrap();
+        assert!(compared > w * h / 2);
+        assert_eq!(mismatched, 0, "{mismatched} of {compared} pixels differ");
     }
 }

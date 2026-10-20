@@ -64,7 +64,9 @@ impl LinuxVirtualDisplayBackend {
     }
 
     fn detect_backend_kind() -> LinuxDisplayBackendKind {
-        let session_type = env::var("XDG_SESSION_TYPE").unwrap_or_default().to_lowercase();
+        let session_type = env::var("XDG_SESSION_TYPE")
+            .unwrap_or_default()
+            .to_lowercase();
         let desktop = env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
             .to_lowercase();
@@ -331,6 +333,19 @@ impl VirtualDisplayBackend for LinuxVirtualDisplayBackend {
         // Tear down any previous virtual outputs first
         self.destroy_all_virtual_displays()?;
 
+        // Wayland virtual outputs belong to the live capture session. XWayland's
+        // xrandr cannot create them and may block the control/heartbeat loop.
+        if env::var("XDG_SESSION_TYPE").as_deref() == Ok("wayland")
+            || env::var_os("WAYLAND_DISPLAY").is_some()
+        {
+            self.active_descriptors = specs.to_vec();
+            info!(
+                count = specs.len(),
+                "Virtual output creation delegated to PipeWire capture sessions"
+            );
+            return Ok(());
+        }
+
         let (primary_opt, candidates) = Self::find_xrandr_virtual_candidates(specs.len());
         let mut anchor_output = primary_opt.unwrap_or_else(|| "eDP-1".to_owned());
 
@@ -374,20 +389,36 @@ impl VirtualDisplayBackend for LinuxVirtualDisplayBackend {
             }
             let _ = newmode_cmd.output();
 
-            let _ = Command::new("xrandr")
+            let added = Command::new("xrandr")
                 .args(["--addmode", &output_name, &mode_name])
                 .output();
-
-            let _ = Command::new("xrandr")
-                .args([
-                    "--output",
-                    &output_name,
-                    "--mode",
-                    &mode_name,
-                    "--right-of",
-                    &anchor_output,
-                ])
-                .output();
+            let enabled = added.and_then(|result| {
+                if !result.status.success() {
+                    return Ok(result);
+                }
+                Command::new("xrandr")
+                    .args([
+                        "--output",
+                        &output_name,
+                        "--mode",
+                        &mode_name,
+                        "--right-of",
+                        &anchor_output,
+                    ])
+                    .output()
+            });
+            let error = match enabled {
+                Ok(result) if result.status.success() => None,
+                Ok(result) => Some(String::from_utf8_lossy(&result.stderr).trim().to_string()),
+                Err(error) => Some(error.to_string()),
+            };
+            if let Some(error) = error {
+                Self::detach_xrandr_output(&output_name, &mode_name);
+                let _ = self.destroy_all_virtual_displays();
+                return Err(PalError::Input(format!(
+                    "Cannot enable X11 virtual output {output_name}: {error}"
+                )));
+            }
 
             anchor_output = output_name.clone();
             self.active_outputs.push(ProvisionedLinuxOutput {

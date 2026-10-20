@@ -4,8 +4,8 @@
     Duplex-KVM Windows 11 Desktop 1GbE Passthrough, Anti-Dropouts & DSCP QoS Setup Script.
 
 .DESCRIPTION
-    Run from an elevated Administrator PowerShell prompt with ExecutionPolicy Bypass:
-        powershell -ExecutionPolicy Bypass -File .\scripts\windows-setup-passthrough.ps1
+    Run from an elevated Administrator PowerShell prompt under your normal script policy:
+        .\scripts\windows-setup-passthrough.ps1
 
     Configures Computer B (Windows 11 Desktop):
     1. Assigns static IP 192.168.137.1/24 to the USB 1GbE adapter connected to the Debian Laptop
@@ -38,15 +38,19 @@ Write-Host "=== Duplex-KVM: Windows 11 1GbE Passthrough & QoS Provisioning ===" 
 
 # 1. Locate the USB 1GbE adapter
 if ([string]::IsNullOrWhiteSpace($KvmAdapterName)) {
-    $usbCandidate = Get-NetAdapter | Where-Object {
+    $usbCandidates = @(Get-NetAdapter -Physical | Where-Object {
         $_.InterfaceDescription -match "USB|Realtek USB|ASIX|AX88179|RTL8153" -and $_.Status -ne "Disabled"
-    } | Select-Object -First 1
+    })
 
-    if ($null -eq $usbCandidate) {
-        Write-Error "Could not auto-detect USB 1GbE adapter. Re-run with -KvmAdapterName '<Adapter Name>'."
+    if ($usbCandidates.Count -eq 0) {
+        Write-Error "No enabled USB Ethernet adapter is recognized by Windows. Reconnect it directly to another USB port and check Device Manager/its driver. The built-in internet adapter must remain unchanged. For a different dedicated adapter, re-run with -KvmAdapterName '<Adapter Name>'."
         exit 1
     }
-    $KvmAdapterName = $usbCandidate.Name
+    if ($usbCandidates.Count -gt 1) {
+        Write-Error "Multiple USB Ethernet adapters detected; re-run with -KvmAdapterName '<PC-to-laptop adapter name>' to choose the correct cable."
+        exit 1
+    }
+    $KvmAdapterName = $usbCandidates[0].Name
 }
 
 $kvmAdapter = Get-NetAdapter -Name $KvmAdapterName
@@ -87,6 +91,9 @@ Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -ErrorAction Silen
 
 # Use netsh to atomically commit both PersistentStore and ActiveStore static IPv4 configuration
 & netsh interface ipv4 set address name="$KvmAdapterName" static $DuplexHostIp $DuplexMask none | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not assign $DuplexHostIp to '$KvmAdapterName' (netsh exit $LASTEXITCODE)."
+}
 
 # Ensure ActiveStore has the IP immediately even if media sense is transitioning
 $existingIp = Get-NetIPAddress -InterfaceIndex $ifIndex -IPAddress $DuplexHostIp -ErrorAction SilentlyContinue
@@ -130,4 +137,12 @@ New-NetFirewallRule -DisplayName "Duplex-KVM TCP (Control & Heartbeat)" `
     -LocalAddress $DuplexHostIp -RemoteAddress $DuplexPeerIp `
     -LocalPort 48101 -Profile Any | Out-Null
 
-Write-Host "=== Windows 11 Duplex-KVM Setup Complete! ($DuplexHostIp <-> $DuplexPeerIp) ===" -ForegroundColor Green
+$verifiedIp = Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 -IPAddress $DuplexHostIp -ErrorAction SilentlyContinue
+if ($null -eq $verifiedIp) {
+    throw "Network setup did not retain $DuplexHostIp on '$KvmAdapterName'. Check adapter/driver status."
+}
+$link = Get-NetAdapter -Name $KvmAdapterName
+Write-Host "=== Duplex-KVM settings saved on '$KvmAdapterName': $DuplexHostIp/24; link $($link.Status), $($link.LinkSpeed) ===" -ForegroundColor Green
+if ($link.Status -ne 'Up') {
+    Write-Warning "The physical PC-to-laptop Ethernet link is not up. Saved IP/firewall/NAT settings do not establish carrier. Check the USB adapter, both cable ends and the laptop Ethernet port."
+}

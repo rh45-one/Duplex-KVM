@@ -1,11 +1,21 @@
 pub mod crypto;
 pub mod hid;
 pub mod keymap;
+pub mod screen_codec;
 pub mod shm;
 pub mod state;
+pub mod tile_codec;
 pub mod video;
+pub use screen_codec::{encode_native_bands, DPXC_BAND_MAGIC};
+pub use tile_codec::{
+    EncodeStats, PixelRect, SliceOutcome, TileDecoder, TileEncoder, TileEncoderConfig, DPXT_MAGIC,
+    TILE_SIZE,
+};
 
-pub use crypto::{ChannelId, CryptoFrameError, CryptoSession, ReplayWindow, WirePayload};
+pub use crypto::{
+    ChannelId, CryptoFrameError, CryptoSession, ReplayWindow, WirePayload, VIDEO_CAP_NATIVE_BANDS,
+    VIDEO_CAP_TILES,
+};
 pub use hid::{
     DepressedKeyBitmap, HidEvent, HidMouseButton, HotkeyAction, PanicDetector, PanicTriggerKind,
     ALL_HID_MODIFIER_USAGES, HID_USAGE_BACKSPACE, HID_USAGE_ESCAPE, HID_USAGE_LEFT_ALT,
@@ -28,7 +38,8 @@ pub use state::{
     TOS_VIDEO_AF41, WINDOWS_HOST_IPV4,
 };
 pub use video::{
-    decode_band_into_bgrx, encode_bgrx_frame_to_bands, packetize_video_frame, CursorShapeBitmap,
+    decode_band_into_bgrx, emit_video_datagrams, encode_bgrx_frame_to_bands, packetize_video_frame,
+    CursorShapeBitmap,
     CursorTelemetry, EncodedVideoFrame, VideoCodec, VideoFragmentHeader, VideoFrameAssembler,
     VideoPacketError, DPXB_BAND_MAGIC, MAX_VIDEO_BITRATE_KBPS, MAX_VIDEO_FRAGMENT_PAYLOAD,
     VIDEO_FLAG_END_OF_FRAME, VIDEO_FLAG_KEYFRAME_IDR, VIDEO_FRAGMENT_HEADER_LEN, VIDEO_FRAME_MAGIC,

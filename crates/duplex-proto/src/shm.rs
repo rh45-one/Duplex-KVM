@@ -57,9 +57,9 @@ pub struct ShmWatchdogBlock {
     pub tx_hid_packets: AtomicU64,
     /// Total HID event batches received over UDP 48100 (DSCP EF).
     pub rx_hid_packets: AtomicU64,
-    /// Total hardware-encoded HEVC video access units transmitted over UDP 48102-48103 (DSCP AF41).
+    /// Total encoded video units transmitted over UDP 48102-48103 (DSCP AF41).
     pub tx_video_frames: AtomicU64,
-    /// Total hardware-encoded HEVC video access units reassembled and submitted to viewer decoder.
+    /// Total video units reassembled and handed to the viewer decoders.
     pub rx_video_frames: AtomicU64,
     /// Total PLI keyframe recovery requests triggered.
     pub pli_keyframes_requested: AtomicU64,

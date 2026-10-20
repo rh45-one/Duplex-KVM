@@ -22,7 +22,8 @@ pub mod fonts {
         include_bytes!("../assets/fonts/SpaceGrotesk-Medium.ttf");
     pub const SPACE_MONO_REGULAR: &[u8] = include_bytes!("../assets/fonts/SpaceMono-Regular.ttf");
     pub const SPACE_MONO_BOLD: &[u8] = include_bytes!("../assets/fonts/SpaceMono-Bold.ttf");
-    pub const DOTO_BOLD: &[u8] = include_bytes!("../assets/fonts/Doto-Bold.ttf");
+    // Doto derivative with a conventional 5×7 zero; see scripts/build-hero-font.py.
+    pub const DOTO_BOLD: &[u8] = include_bytes!("../assets/fonts/DuplexDots-Bold.ttf");
 
     /// `(file name, bytes)` for every embedded face. File names are also the Web UI routes
     /// (`/fonts/<file name>`).
@@ -31,41 +32,33 @@ pub mod fonts {
         ("SpaceGrotesk-Medium.ttf", SPACE_GROTESK_MEDIUM),
         ("SpaceMono-Regular.ttf", SPACE_MONO_REGULAR),
         ("SpaceMono-Bold.ttf", SPACE_MONO_BOLD),
-        ("Doto-Bold.ttf", DOTO_BOLD),
+        ("DuplexDots-Bold.ttf", DOTO_BOLD),
     ];
 
     /// Family names as registered by fontconfig / Pango / CSS.
     pub const FAMILY_GROTESK: &str = "Space Grotesk";
     pub const FAMILY_MONO: &str = "Space Mono";
-    pub const FAMILY_DOTO: &str = "Doto";
+    pub const FAMILY_DOTO: &str = "Duplex Dots";
 
     /// Legacy (nameID 1) GDI face names. GDI does not understand typographic families, so the
     /// Medium static instance must be requested by its own face name with `FW_NORMAL`.
     pub const GDI_FACE_GROTESK: &str = "Space Grotesk";
     pub const GDI_FACE_GROTESK_MEDIUM: &str = "Space Grotesk Medium";
     pub const GDI_FACE_MONO: &str = "Space Mono";
-    /// Doto Bold is a RIBBI style: request face `"Doto"` with `FW_BOLD`.
-    pub const GDI_FACE_DOTO: &str = "Doto";
+    /// The Doto-derived face is a RIBBI style: request it with `FW_BOLD`.
+    pub const GDI_FACE_DOTO: &str = "Duplex Dots";
 }
 
-/// Type scale in logical pixels (DIPs). Per screen we use at most four sizes:
-/// hero (Doto, fluid), medium, body, label.
+/// Three type sizes per screen: one hero, body text, and technical labels.
 pub mod type_scale {
-    /// Hero glyph (Doto) per layout tier.
-    pub const HERO_COMPACT: f32 = 120.0;
-    pub const HERO_MEDIUM: f32 = 168.0;
-    pub const HERO_WIDE: f32 = 224.0;
-    /// Mode title, RTT readout.
-    pub const MEDIUM: f32 = 24.0;
-    /// Body copy, stat values, descriptions.
-    pub const BODY: f32 = 14.0;
-    /// Buttons (Space Mono caps).
-    pub const BUTTON: f32 = 13.0;
-    /// ALL CAPS Space Mono instrument labels.
+    pub const HERO_COMPACT: f32 = 64.0;
+    pub const HERO_MEDIUM: f32 = 64.0;
+    pub const HERO_WIDE: f32 = 80.0;
+    pub const MEDIUM: f32 = 16.0;
+    pub const BODY: f32 = 16.0;
+    pub const BUTTON: f32 = 11.0;
     pub const LABEL: f32 = 11.0;
-    /// Letter-spacing for labels (em).
     pub const LABEL_TRACKING_EM: f32 = 0.08;
-    /// Letter-spacing for buttons (em).
     pub const BUTTON_TRACKING_EM: f32 = 0.06;
 }
 
@@ -105,27 +98,27 @@ pub const DARK: Palette = Palette {
     text_primary: 0xE8E8E8,
     text_display: 0xFFFFFF,
     accent: 0xD71921,
-    success: 0x4A9E5C,
+    success: 0x72B481,
     warning: 0xD4A843,
-    interactive: 0x5B9BF6,
+    interactive: 0xFFFFFF,
     segment_empty: 0x222222,
 };
 
 /// Light mode: printed technical manual. Off-white paper, black ink.
 pub const LIGHT: Palette = Palette {
-    black: 0xF5F5F5,
-    surface: 0xFFFFFF,
-    surface_raised: 0xF0F0F0,
+    black: 0xF7F5F0,
+    surface: 0xFFFEFA,
+    surface_raised: 0xECE9E2,
     border: 0xE8E8E8,
-    border_visible: 0xCCCCCC,
-    text_disabled: 0x999999,
-    text_secondary: 0x666666,
+    border_visible: 0xCECAC2,
+    text_disabled: 0x77746E,
+    text_secondary: 0x62605B,
     text_primary: 0x1A1A1A,
     text_display: 0x000000,
     accent: 0xD71921,
-    success: 0x4A9E5C,
-    warning: 0xD4A843,
-    interactive: 0x007AFF,
+    success: 0x327541,
+    warning: 0x896715,
+    interactive: 0x000000,
     segment_empty: 0xE0E0E0,
 };
 
@@ -349,7 +342,8 @@ pub const MODES: [ModeSpec; 4] = [
         glyph: "0",
         name: "IDLE",
         title: "Idle",
-        description: "Local only. Peripherals and displays stay independent; 1GbE passthrough stays up.",
+        description:
+            "Local only. Peripherals and displays stay independent; 1GbE passthrough stays up.",
         shortcut: "CTRL+ALT+0",
         api_target: "idle",
         mode: OperationalMode::Mode0Idle,
@@ -439,7 +433,7 @@ pub fn fmt_count(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3 * 3);
     for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push('\u{2009}');
         }
         out.push(ch);
@@ -534,8 +528,23 @@ pub fn peer_status(online: bool, connected: bool) -> (&'static str, Level) {
     } else if connected {
         ("LINKED", Level::Good)
     } else {
-        ("STANDBY", Level::Moderate)
+        ("NO HEARTBEAT", Level::Moderate)
     }
+}
+
+/// Native appearance is shared between the GTK and Win32 front ends. Dark on first launch.
+pub fn load_light_appearance() -> bool {
+    std::fs::read_to_string(crate::updater::get_config_path().with_file_name("appearance"))
+        .map(|v| v.trim() == "light")
+        .unwrap_or(false)
+}
+
+pub fn save_light_appearance(light: bool) {
+    let path = crate::updater::get_config_path().with_file_name("appearance");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, if light { "light" } else { "dark" });
 }
 
 #[cfg(test)]

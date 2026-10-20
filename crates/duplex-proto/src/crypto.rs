@@ -70,7 +70,24 @@ pub enum WirePayload {
     VideoKeyframeRequest {
         monitor_index: u8,
     },
+    /// Optional extension; older peers ignore this unknown payload and keep DPXB.
+    VideoCapabilities {
+        native_lossless: bool,
+    },
+    OperationError {
+        message: String,
+    },
+    /// Extension: bitmask of decodable stream formats (`VIDEO_CAP_*`).
+    /// Older peers cannot decode this variant and ignore it.
+    VideoCapabilitiesV2 {
+        codecs: u32,
+    },
 }
+
+/// Legacy native-resolution zlib bands (DPXC).
+pub const VIDEO_CAP_NATIVE_BANDS: u32 = 1;
+/// DPXT lossless/JPEG tiles with lossless refinement.
+pub const VIDEO_CAP_TILES: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum CryptoFrameError {

@@ -18,3 +18,7 @@ duplex-pal.workspace = true
 duplex-guard = { path = "../duplex-guard" }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+getrandom = "0.2.17"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true

@@ -6,19 +6,20 @@
 pub mod net;
 pub mod ring;
 pub mod shm;
+pub mod stream;
 
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-use duplex_proto::{CursorTelemetry, DisplayDescriptor, EncodedVideoFrame, HidEvent, PanicTriggerKind};
+use duplex_proto::{DisplayDescriptor, EncodedVideoFrame, HidEvent, PanicTriggerKind};
 use std::sync::Arc;
 use thiserror::Error;
 
 pub use net::{
     apply_udp_qos, bind_qos_tcp_listener, bind_qos_udp_socket, configure_tcp_stream_qos,
-    validate_strict_interface_ip, QosClass,
+    local_link_address_available, validate_strict_interface_ip, QosClass,
 };
 pub use ring::SpscRingBuffer;
 pub use shm::{force_terminate_process, is_process_alive, monotonic_now_ns, ShmWatchdog};
@@ -83,36 +84,64 @@ pub trait VirtualDisplayBackend: Send {
     fn active_virtual_displays(&self) -> &[DisplayDescriptor];
 }
 
-/// Cross-platform Low-Latency Hardware Video Pipeline (`DXGI+NVENC/D3D11VA` on Windows, `PipeWire+VA-API` on Debian Linux).
+/// Video decoding capabilities advertised by the peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerVideoCaps {
+    /// Legacy native-resolution zlib bands (DPXC).
+    pub native_lossless: bool,
+    /// DPXT lossless/JPEG tiles with lossless refinement.
+    pub tiles: bool,
+}
+
+/// Why a [`VideoSink`] did not take a unit.
+#[derive(Debug)]
+pub enum SinkError {
+    /// The link is saturated; retry later with the returned unit.
+    Full(EncodedVideoFrame),
+    /// The link is gone; the encoder should stop.
+    Closed,
+}
+
+/// Destination for encoded video produced by a sender pipeline.
+pub trait VideoSink: Send + Sync {
+    /// Queues one encoded unit without blocking. Encoders retry `Full` units
+    /// (skipping stale captures meanwhile) rather than dropping encoded data.
+    fn try_send(&self, frame: EncodedVideoFrame) -> Result<(), SinkError>;
+}
+
+/// Accepts reassembled video units from the network receive thread.
+pub trait VideoFrameConsumer: Send + Sync {
+    /// Enqueues for decoding without blocking the network thread.
+    fn submit(&self, frame: EncodedVideoFrame);
+}
+
+/// Screen streaming: capture + encode on the sender, decode + present on the
+/// receiver. All heavy work runs on dedicated threads, never the daemon loop.
 pub trait VideoPipelineBackend: Send {
-    /// Starts capturing the specified virtual monitors (with hardware cursor decoupled/hidden in capture)
-    /// and hardware-encoding low-latency HEVC streams capped at `max_bitrate_kbps` (60 Mbps) per monitor.
+    /// Selects the best codec the peer can decode (takes effect immediately).
+    fn set_peer_video_caps(&mut self, caps: PeerVideoCaps);
+
+    /// Starts capture/encoding for the specified virtual monitors.
     fn start_sender(
         &mut self,
         monitors: &[DisplayDescriptor],
-        max_bitrate_kbps: u32,
+        sink: Arc<dyn VideoSink>,
     ) -> Result<(), PalError>;
 
-    /// Non-blocking poll draining encoded HEVC access units and decoupled hardware cursor telemetry.
-    fn poll_encoded_frames(
-        &mut self,
-        out_frames: &mut Vec<EncodedVideoFrame>,
-        out_cursor: &mut Option<CursorTelemetry>,
-    ) -> Result<usize, PalError>;
-
-    /// Forces an immediate IDR keyframe on `monitor_index` (in response to a PLI request or viewer attach).
+    /// Requests a full refresh of `monitor_index` (packet loss or viewer attach).
     fn request_keyframe(&mut self, monitor_index: u8) -> Result<(), PalError>;
 
-    /// Spawns borderless fullscreen hardware-decoded viewer windows (`VA-API` on Debian, `D3D11VA` on Windows).
-    fn start_viewer(&mut self, monitors: &[DisplayDescriptor]) -> Result<(), PalError>;
+    /// Opens fullscreen viewers and returns the consumer for incoming video.
+    fn start_viewer(
+        &mut self,
+        monitors: &[DisplayDescriptor],
+    ) -> Result<Arc<dyn VideoFrameConsumer>, PalError>;
 
-    /// Submits a reassembled hardware-encoded HEVC access unit to the fullscreen viewer decoder for `frame.monitor_index`.
-    fn submit_encoded_frame(&mut self, frame: &EncodedVideoFrame) -> Result<(), PalError>;
+    /// Reports monitors whose decoders detected loss (send them a refresh
+    /// request) and fails when a capture helper or viewer stopped working.
+    fn poll_health(&mut self, refresh_requests: &mut Vec<u8>) -> Result<(), PalError>;
 
-    /// Updates the decoupled hardware cursor position/shape directly on the viewer display at 1000 Hz.
-    fn update_hardware_cursor(&mut self, cursor: &CursorTelemetry) -> Result<(), PalError>;
-
-    /// Immediately stops all encoders/decoders and destroys all borderless fullscreen viewer windows.
+    /// Immediately stops all encoders/decoders and destroys all viewer windows.
     fn close_all_viewer_windows(&mut self) -> Result<(), PalError>;
 }
 

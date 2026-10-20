@@ -109,24 +109,33 @@ pub fn run_guard_with_args(args: &[String]) {
     };
 
     info!("Attached to Duplex shared-memory watchdog block");
+    let supervised_pid = shm.block().daemon_pid.load(Ordering::Acquire);
 
     loop {
         let now_ns = monotonic_now_ns();
         let block = shm.block();
 
         let daemon_pid = block.daemon_pid.load(Ordering::Acquire);
+        if daemon_pid != supervised_pid || supervised_pid == 0 {
+            info!(
+                supervised_pid,
+                daemon_pid, "Daemon ownership changed; exiting old watchdog"
+            );
+            return;
+        }
         let mode = block.active_mode.load(Ordering::Acquire);
         let grab_active = block.input_grab_active.load(Ordering::Acquire);
         let vdisp_active = block.virtual_displays_active.load(Ordering::Acquire);
 
-        if (mode != OperationalMode::Mode0Idle.as_u8() || grab_active || vdisp_active > 0)
-            && daemon_pid != 0
-            && !is_process_alive(daemon_pid)
-        {
-            execute_emergency_reclaim(
-                &shm,
-                WatchdogTripReason::DaemonProcessTerminated { pid: daemon_pid },
-            );
+        if !is_process_alive(daemon_pid) {
+            if mode != OperationalMode::Mode0Idle.as_u8() || grab_active || vdisp_active > 0 {
+                execute_emergency_reclaim(
+                    &shm,
+                    WatchdogTripReason::DaemonProcessTerminated { pid: daemon_pid },
+                );
+            }
+            info!(daemon_pid, "Supervised daemon exited; watchdog stopping");
+            return;
         } else if let Some(trip_reason) = block.evaluate_liveness(now_ns) {
             execute_emergency_reclaim(&shm, trip_reason);
         }

@@ -28,6 +28,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Networking_WinSock",
     "Win32_Security",
@@ -35,9 +39,14 @@ windows = { version = "0.58", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_Performance",
+    "Win32_System_SystemInformation",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_System_SystemServices",
+    "Win32_UI_Controls",
+    "Win32_UI_HiDpi",
     "Win32_UI_Input",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

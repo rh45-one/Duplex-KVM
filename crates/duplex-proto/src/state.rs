@@ -10,9 +10,9 @@ pub const DEBIAN_LAPTOP_IPV4: &str = "192.168.137.2";
 pub const PORT_HID_UDP: u16 = 48100;
 /// Dedicated TCP port for state-machine control and 50 Hz peer heartbeats.
 pub const PORT_CONTROL_TCP: u16 = 48101;
-/// Dedicated UDP port for primary/first virtual monitor HEVC stream.
+/// Dedicated UDP port for the primary/first monitor's video stream.
 pub const PORT_VIDEO_STREAM_0_UDP: u16 = 48102;
-/// Dedicated UDP port for secondary virtual monitor HEVC stream.
+/// Dedicated UDP port for the secondary monitor's video stream.
 pub const PORT_VIDEO_STREAM_1_UDP: u16 = 48103;
 
 /// Converts a 6-bit DSCP class value into an 8-bit IPv4 `IP_TOS` socket option byte
@@ -124,8 +124,18 @@ impl OperationalMode {
     pub const fn required_virtual_displays(self, role: NodeRole) -> u8 {
         match (self, role) {
             (Self::Mode0Idle, _) => 0,
-            (Self::Mode1PcPrimary { extend_display: true }, NodeRole::WindowsDesktop) => 1,
-            (Self::Mode1PcPrimary { extend_display: false }, _) => 0,
+            (
+                Self::Mode1PcPrimary {
+                    extend_display: true,
+                },
+                NodeRole::WindowsDesktop,
+            ) => 1,
+            (
+                Self::Mode1PcPrimary {
+                    extend_display: false,
+                },
+                _,
+            ) => 0,
             (Self::Mode1PcPrimary { .. }, NodeRole::DebianLaptop) => 0,
             (Self::Mode2LaptopPrimary, NodeRole::DebianLaptop) => 2,
             (Self::Mode2LaptopPrimary, NodeRole::WindowsDesktop) => 0,
@@ -143,7 +153,12 @@ impl OperationalMode {
     pub const fn expected_incoming_video_streams(self, role: NodeRole) -> u8 {
         match (self, role) {
             (Self::Mode0Idle, _) => 0,
-            (Self::Mode1PcPrimary { extend_display: true }, NodeRole::DebianLaptop) => 1,
+            (
+                Self::Mode1PcPrimary {
+                    extend_display: true,
+                },
+                NodeRole::DebianLaptop,
+            ) => 1,
             (Self::Mode1PcPrimary { .. }, _) => 0,
             (Self::Mode2LaptopPrimary, NodeRole::WindowsDesktop) => 2,
             (Self::Mode2LaptopPrimary, NodeRole::DebianLaptop) => 0,
@@ -229,6 +244,10 @@ impl ModeStateMachine {
         reason: TransitionReason,
         peer_epoch: Option<u64>,
     ) -> Result<OperationalMode, StateMachineError> {
+        // Reordered/redundant UDP control packets must never undo a newer mode.
+        if peer_epoch.is_some_and(|pe| pe < self.epoch) {
+            return Ok(self.current);
+        }
         if matches!(
             reason,
             TransitionReason::HardwarePanicEscape | TransitionReason::WatchdogTimeout
@@ -242,9 +261,10 @@ impl ModeStateMachine {
         }
 
         if let Some(pe) = peer_epoch {
-            if pe > self.epoch {
-                self.epoch = pe;
+            if pe == self.epoch {
+                return Ok(self.current);
             }
+            self.epoch = pe;
             self.current = target;
             return Ok(self.current);
         }
@@ -275,7 +295,12 @@ pub struct DisplayDescriptor {
 
 impl DisplayDescriptor {
     /// Generates a deterministic 128-byte VESA EDID 1.4 block matching the requested resolution and refresh rate.
-    pub fn synthesize_edid(width_px: u32, height_px: u32, refresh_hz: u32, monitor_index: u8) -> Vec<u8> {
+    pub fn synthesize_edid(
+        width_px: u32,
+        height_px: u32,
+        refresh_hz: u32,
+        monitor_index: u8,
+    ) -> Vec<u8> {
         let mut edid = vec![0u8; 128];
         // Fixed 8-byte EDID 1.4 header
         edid[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
@@ -307,9 +332,11 @@ impl DisplayDescriptor {
         let h_blank: u16 = 160;
         let v_active = height_px.min(4095) as u16;
         let v_blank: u16 = 45;
-        let pixel_clock_10khz =
-            ((u64::from(h_active + h_blank) * u64::from(v_active + v_blank) * u64::from(refresh_hz)) / 10_000)
-                .min(65535) as u16;
+        let pixel_clock_10khz = ((u64::from(h_active + h_blank)
+            * u64::from(v_active + v_blank)
+            * u64::from(refresh_hz))
+            / 10_000)
+            .min(65535) as u16;
 
         edid[54..56].copy_from_slice(&pixel_clock_10khz.to_le_bytes());
         edid[56] = (h_active & 0xFF) as u8;
@@ -323,5 +350,62 @@ impl DisplayDescriptor {
         let sum: u8 = edid[0..127].iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
         edid[127] = 0u8.wrapping_sub(sum);
         edid
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_and_reordered_modes_do_not_undo_current_mode() {
+        let mut sm = ModeStateMachine::new();
+        let pc = OperationalMode::Mode1PcPrimary {
+            extend_display: true,
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                sm.transition_with_epoch(pc, TransitionReason::PeerRequest, Some(1))
+                    .unwrap(),
+                pc
+            );
+            assert_eq!(sm.epoch(), 1);
+        }
+        sm.transition_with_epoch(
+            OperationalMode::Mode2LaptopPrimary,
+            TransitionReason::PeerRequest,
+            Some(2),
+        )
+        .unwrap();
+        assert_eq!(
+            sm.transition_with_epoch(pc, TransitionReason::PeerRequest, Some(1))
+                .unwrap(),
+            OperationalMode::Mode2LaptopPrimary
+        );
+        assert_eq!(sm.epoch(), 2);
+        assert_eq!(
+            sm.transition(pc, TransitionReason::HardwarePanicEscape)
+                .unwrap(),
+            OperationalMode::Mode0Idle
+        );
+        assert_eq!(sm.epoch(), 3);
+        assert_eq!(
+            sm.transition_with_epoch(pc, TransitionReason::PeerRequest, Some(2))
+                .unwrap(),
+            OperationalMode::Mode0Idle
+        );
+    }
+
+    #[test]
+    fn mode2_pairs_two_laptop_senders_with_two_windows_viewers() {
+        let mode = OperationalMode::Mode2LaptopPrimary;
+        assert_eq!(mode.required_virtual_displays(NodeRole::DebianLaptop), 2);
+        assert_eq!(
+            mode.expected_incoming_video_streams(NodeRole::WindowsDesktop),
+            2
+        );
+        assert_eq!(mode.required_virtual_displays(NodeRole::WindowsDesktop), 0);
+        assert!(mode.should_capture_input(NodeRole::WindowsDesktop));
+        assert!(!mode.should_capture_input(NodeRole::DebianLaptop));
     }
 }

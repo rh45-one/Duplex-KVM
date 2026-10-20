@@ -14,9 +14,7 @@ use duplex_proto::{
     dscp_to_tos, DSCP_AF41, DSCP_CS6, DSCP_EF, TOS_CONTROL_CS6, TOS_HID_EF, TOS_VIDEO_AF41,
 };
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket};
-use tracing::debug;
-#[cfg(target_os = "windows")]
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Traffic class governing DSCP `IP_TOS` tagging, Linux `SO_PRIORITY` hardware ring queuing,
 /// and anti-bufferbloat kernel socket buffer sizing.
@@ -26,7 +24,7 @@ pub enum QosClass {
     HidExpeditedForwarding,
     /// Port 48101: DSCP CS6 (`0x30` -> `IP_TOS 0xC0`), 50 Hz heartbeat & state machine control.
     ControlNetworkControl,
-    /// UDP 48102..=48103: DSCP AF41 (`0x22` -> `IP_TOS 0x88`), 60 Mbps HEVC video stream.
+    /// UDP 48102..=48103: DSCP AF41 (`0x22` -> `IP_TOS 0x88`), paced native-resolution video.
     VideoAssuredForwarding,
 }
 
@@ -67,7 +65,7 @@ impl QosClass {
         match self {
             // Tight 256 KiB buffers for HID and Control prevent stale queue accumulation
             Self::HidExpeditedForwarding | Self::ControlNetworkControl => (262_144, 262_144),
-            // 4 MiB buffers for high-bitrate 60 Mbps HEVC slices
+            // 4 MiB absorbs ~45 ms of paced 700 Mbit/s video bursts
             Self::VideoAssuredForwarding => (4 * 1024 * 1024, 4 * 1024 * 1024),
         }
     }
@@ -87,6 +85,12 @@ pub fn validate_strict_interface_ip(ip: Ipv4Addr) -> Result<(), PalError> {
         )));
     }
     Ok(())
+}
+
+/// An existing socket may remain bound after its interface loses its address.
+/// Probe a fresh ephemeral binding rather than trusting that stale socket.
+pub fn local_link_address_available(ip: Ipv4Addr) -> bool {
+    validate_strict_interface_ip(ip).is_ok() && UdpSocket::bind((ip, 0)).is_ok()
 }
 
 #[cfg(target_os = "linux")]
@@ -120,20 +124,39 @@ fn apply_raw_socket_qos(fd: std::os::unix::io::RawFd, qos: QosClass) -> Result<(
         );
 
         let (rcv_buf, snd_buf) = qos.buffer_sizes();
-        let _ = libc::setsockopt(
+        let set = |option: libc::c_int, value: libc::c_int| {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                option,
+                &value as *const libc::c_int as *const libc::c_void,
+                core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) == 0
+        };
+        // The *FORCE variants bypass net.core.[rw]mem_max when privileged.
+        if !set(libc::SO_RCVBUFFORCE, rcv_buf) {
+            set(libc::SO_RCVBUF, rcv_buf);
+        }
+        if !set(libc::SO_SNDBUFFORCE, snd_buf) {
+            set(libc::SO_SNDBUF, snd_buf);
+        }
+        let mut effective: libc::c_int = 0;
+        let mut length = core::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        libc::getsockopt(
             fd,
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
-            &rcv_buf as *const libc::c_int as *const libc::c_void,
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            &mut effective as *mut libc::c_int as *mut libc::c_void,
+            &mut length,
         );
-        let _ = libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &snd_buf as *const libc::c_int as *const libc::c_void,
-            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        // Linux reports twice the requested size (bookkeeping overhead).
+        if qos == QosClass::VideoAssuredForwarding && effective < rcv_buf {
+            warn!(
+                requested = rcv_buf,
+                effective,
+                "Video receive buffer is limited by net.core.rmem_max; run scripts/debian-setup-link.sh to raise it"
+            );
+        }
     }
 
     debug!(

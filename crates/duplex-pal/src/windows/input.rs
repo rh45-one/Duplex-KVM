@@ -14,10 +14,12 @@ use duplex_proto::{
     hid_to_windows_scancode, windows_scancode_to_hid, DepressedKeyBitmap, HidEvent, HidMouseButton,
     HotkeyAction, OperationalMode, PanicDetector, ALL_HID_MODIFIER_USAGES,
 };
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 use tracing::{info, warn};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT,
@@ -27,16 +29,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::{
-    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE,
-    RAWINPUTHEADER, RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RIDEV_INPUTSINK, RID_INPUT, RIM_TYPEMOUSE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW,
+    CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetMessageW, PeekMessageW,
     PostThreadMessageW, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK,
     HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_EXTENDED, LLKHF_INJECTED, LLKHF_UP, LLMHF_INJECTED, MSG,
-    MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_INPUT, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDOWN,
+    WM_XBUTTONUP,
 };
 
 /// Magic value stamped onto `dwExtraInfo` by our `SendInput` calls so our own hooks ignore them.
@@ -45,7 +48,44 @@ pub const DUPLEX_INJECTED_MAGIC: usize = 0x4450_4C58_4B56_4D01usize;
 const WHEEL_DELTA: i16 = 120;
 const XBUTTON1: u16 = 1;
 const XBUTTON2: u16 = 2;
-const MOUSE_MOVE_RELATIVE: u16 = 0x00;
+const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
+
+fn send_inputs_checked(inputs: &[INPUT]) -> Result<(), PalError> {
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
+    if sent != inputs.len() as u32 {
+        return Err(PalError::Input(format!(
+            "Windows SendInput inserted {sent}/{} events ({}). Windows can block injection into an elevated application; the daemon must run at that application's integrity level.",
+            inputs.len(), std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct HookResources {
+    window: HWND,
+    keyboard: HHOOK,
+    mouse: HHOOK,
+}
+
+impl Drop for HookResources {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.keyboard.is_invalid() {
+                let _ = UnhookWindowsHookEx(self.keyboard);
+            }
+            if !self.mouse.is_invalid() {
+                let _ = UnhookWindowsHookEx(self.mouse);
+            }
+            if !self.window.is_invalid() {
+                let _ = DestroyWindow(self.window);
+            }
+        }
+    }
+}
 
 /// Global wait-free SPSC ring buffer written exclusively by the Win32 hook thread and read by `duplexd`.
 static WIN_INPUT_RING: SpscRingBuffer<CapturedInputEvent, 4096> = SpscRingBuffer::new();
@@ -93,9 +133,8 @@ unsafe extern "system" fn low_level_keyboard_proc(
                 WIN_CAPTURE_ACTIVE.store(false, Ordering::SeqCst);
                 WIN_PANIC_LATCHED.store(true, Ordering::SeqCst);
                 // Flush remote modifiers on the peer before disconnecting to Mode0Idle
-                let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(
-                    HidEvent::ReleaseAllModifiers,
-                ));
+                let _ =
+                    WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(HidEvent::ReleaseAllModifiers));
                 let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::PanicTriggered(trigger_kind));
                 let tid = WIN_HOOK_THREAD_ID.load(Ordering::Acquire);
                 if tid != 0 {
@@ -111,16 +150,13 @@ unsafe extern "system" fn low_level_keyboard_proc(
                     HotkeyAction::SelectMode(m) => 100u8 + m.as_u8(),
                 };
                 WIN_HOTKEY_LATCHED.store(code, Ordering::Release);
-                let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(
-                    HidEvent::ReleaseAllModifiers,
-                ));
+                let _ =
+                    WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(HidEvent::ReleaseAllModifiers));
                 return LRESULT(1);
             }
 
-            let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(HidEvent::Key {
-                usage,
-                pressed,
-            }));
+            let _ =
+                WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(HidEvent::Key { usage, pressed }));
             // Suppress local processing on Windows while docked to Debian Laptop
             return LRESULT(1);
         }
@@ -211,6 +247,7 @@ unsafe extern "system" fn low_level_mouse_proc(
 /// Complete Windows 11 `InputBackend` (`SetWindowsHookExW` + `WM_INPUT` + `SendInput`).
 pub struct WindowsInputBackend {
     hook_thread: Option<JoinHandle<()>>,
+    hook_stop: Arc<AtomicBool>,
     depressed: DepressedKeyBitmap,
     shm: Option<Arc<crate::shm::ShmWatchdog>>,
     last_hotkey_ns: u64,
@@ -221,6 +258,7 @@ impl WindowsInputBackend {
     pub fn new(shm: Option<Arc<crate::shm::ShmWatchdog>>) -> Result<Self, PalError> {
         Ok(Self {
             hook_thread: None,
+            hook_stop: Arc::new(AtomicBool::new(true)),
             depressed: DepressedKeyBitmap::new(),
             shm,
             last_hotkey_ns: 0,
@@ -337,56 +375,81 @@ impl InputBackend for WindowsInputBackend {
             (*HOOK_PANIC_DETECTOR.0.get()).reset();
         }
         WIN_PANIC_LATCHED.store(false, Ordering::SeqCst);
-        WIN_CAPTURE_ACTIVE.store(true, Ordering::SeqCst);
+        while WIN_INPUT_RING.try_pop().is_some() {}
+        self.hook_stop.store(false, Ordering::Release);
+        let stop = self.hook_stop.clone();
+        let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
 
         let handle = thread::Builder::new()
             .name("duplex-win32-hook".into())
             .spawn(move || unsafe {
                 let tid = GetCurrentThreadId();
+                // PostThreadMessage fails before a message queue exists.
+                let mut queue_msg = MSG::default();
+                let _ = PeekMessageW(&mut queue_msg, HWND::default(), 0, 0, PM_NOREMOVE);
                 WIN_HOOK_THREAD_ID.store(tid, Ordering::Release);
 
-                // Create message-only window to receive unaccelerated WM_INPUT Raw Input deltas
-                let msg_hwnd = CreateWindowExW(
-                    WINDOW_EX_STYLE(0),
-                    windows::core::w!("STATIC"),
-                    windows::core::w!("DuplexRawInputSink"),
-                    WINDOW_STYLE(0),
-                    0,
-                    0,
-                    0,
-                    0,
-                    HWND_MESSAGE,
-                    None,
-                    HINSTANCE::default(),
-                    None,
-                )
-                .unwrap_or(HWND::default());
-
-                if !msg_hwnd.is_invalid() {
+                let setup = (|| -> Result<HookResources, windows::core::Error> {
+                    let mut resources = HookResources::default();
+                    let module = HINSTANCE(GetModuleHandleW(None)?.0);
+                    resources.window = CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        windows::core::w!("STATIC"),
+                        windows::core::w!("DuplexRawInputSink"),
+                        WINDOW_STYLE(0),
+                        0,
+                        0,
+                        0,
+                        0,
+                        HWND_MESSAGE,
+                        None,
+                        module,
+                        None,
+                    )?;
                     let rid = RAWINPUTDEVICE {
                         usUsagePage: 0x01, // HID_USAGE_PAGE_GENERIC
                         usUsage: 0x02,     // HID_USAGE_GENERIC_MOUSE
                         dwFlags: RIDEV_INPUTSINK,
-                        hwndTarget: msg_hwnd,
+                        hwndTarget: resources.window,
                     };
-                    let _ = RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32);
+                    RegisterRawInputDevices(&[rid], size_of::<RAWINPUTDEVICE>() as u32)?;
+
+                    resources.keyboard = SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(low_level_keyboard_proc),
+                        module,
+                        0,
+                    )?;
+                    resources.mouse =
+                        SetWindowsHookExW(WH_MOUSE_LL, Some(low_level_mouse_proc), module, 0)?;
+                    Ok(resources)
+                })();
+                let _resources = match setup {
+                    Ok(resources) => resources,
+                    Err(error) => {
+                        let _ = ready_tx
+                            .send(Err(format!("Win32 capture initialization failed: {error}")));
+                        WIN_HOOK_THREAD_ID.store(0, Ordering::Release);
+                        return;
+                    }
+                };
+                if ready_tx.send(Ok(())).is_err() {
+                    WIN_HOOK_THREAD_ID.store(0, Ordering::Release);
+                    return;
                 }
 
-                let kb_hook = SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(low_level_keyboard_proc),
-                    HINSTANCE::default(),
-                    0,
-                );
-                let ms_hook = SetWindowsHookExW(
-                    WH_MOUSE_LL,
-                    Some(low_level_mouse_proc),
-                    HINSTANCE::default(),
-                    0,
-                );
-
                 let mut msg = MSG::default();
-                while GetMessageW(&mut msg, HWND::default(), 0, 0).into() {
+                while !stop.load(Ordering::Acquire) {
+                    let result = GetMessageW(&mut msg, HWND::default(), 0, 0).0;
+                    if result <= 0 {
+                        if result < 0 {
+                            warn!(
+                                "Win32 input message pump failed: {}",
+                                std::io::Error::last_os_error()
+                            );
+                        }
+                        break;
+                    }
                     if msg.message == WM_INPUT && WIN_CAPTURE_ACTIVE.load(Ordering::Relaxed) {
                         let mut raw = RAWINPUT::default();
                         let mut raw_size = size_of::<RAWINPUT>() as u32;
@@ -399,9 +462,11 @@ impl InputBackend for WindowsInputBackend {
                         );
                         if copied != u32::MAX && raw.header.dwType == RIM_TYPEMOUSE.0 {
                             let mouse = raw.data.mouse;
-                            if (mouse.usFlags.0 & MOUSE_MOVE_RELATIVE) == MOUSE_MOVE_RELATIVE {
-                                let dx = mouse.lLastX.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
-                                let dy = mouse.lLastY.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            if mouse.usFlags.0 & MOUSE_MOVE_ABSOLUTE == 0 {
+                                let dx =
+                                    mouse.lLastX.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                                let dy =
+                                    mouse.lLastY.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
                                 if dx != 0 || dy != 0 {
                                     let _ = WIN_INPUT_RING.try_push(CapturedInputEvent::Hid(
                                         HidEvent::MouseMoveRel { dx, dy },
@@ -414,20 +479,24 @@ impl InputBackend for WindowsInputBackend {
                     DispatchMessageW(&msg);
                 }
 
-                if let Ok(h) = kb_hook {
-                    let _ = UnhookWindowsHookEx(h);
-                }
-                if let Ok(h) = ms_hook {
-                    let _ = UnhookWindowsHookEx(h);
-                }
-                if !msg_hwnd.is_invalid() {
-                    let _ = DestroyWindow(msg_hwnd);
-                }
+                WIN_CAPTURE_ACTIVE.store(false, Ordering::Release);
                 WIN_HOOK_THREAD_ID.store(0, Ordering::Release);
             })
             .map_err(|e| PalError::Input(format!("Failed to spawn Win32 hook thread: {e}")))?;
 
         self.hook_thread = Some(handle);
+        match ready_rx.recv_timeout(Duration::from_millis(750)) {
+            Ok(Ok(())) => WIN_CAPTURE_ACTIVE.store(true, Ordering::Release),
+            result => {
+                let message = match result {
+                    Ok(Err(error)) => error,
+                    Err(error) => format!("Win32 input capture did not become ready: {error}"),
+                    Ok(Ok(())) => unreachable!(),
+                };
+                let _ = self.stop_capture();
+                return Err(PalError::Input(message));
+            }
+        }
         if let Some(ref shm) = self.shm {
             shm.block().input_grab_active.store(true, Ordering::Release);
         }
@@ -437,6 +506,7 @@ impl InputBackend for WindowsInputBackend {
 
     fn stop_capture(&mut self) -> Result<(), PalError> {
         WIN_CAPTURE_ACTIVE.store(false, Ordering::SeqCst);
+        self.hook_stop.store(true, Ordering::Release);
         let tid = WIN_HOOK_THREAD_ID.load(Ordering::Acquire);
         if tid != 0 {
             unsafe {
@@ -458,6 +528,16 @@ impl InputBackend for WindowsInputBackend {
         &mut self,
         out: &mut Vec<CapturedInputEvent>,
     ) -> Result<usize, PalError> {
+        if self
+            .hook_thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+            && !WIN_PANIC_LATCHED.load(Ordering::Acquire)
+        {
+            return Err(PalError::Input(
+                "Windows capture thread exited unexpectedly".into(),
+            ));
+        }
         let count = WIN_INPUT_RING.drain_into(out, 256);
         let hotkey_code = WIN_HOTKEY_LATCHED.swap(0, Ordering::AcqRel);
         if hotkey_code == 10 {
@@ -480,13 +560,11 @@ impl InputBackend for WindowsInputBackend {
         match *event {
             HidEvent::Key { usage, pressed } => {
                 if let Some((scancode, is_extended)) = hid_to_windows_scancode(usage) {
+                    let input = Self::build_scancode_input(scancode, is_extended, pressed);
+                    send_inputs_checked(&[input])?;
                     self.depressed.set_pressed(usage, pressed);
                     if let Some(ref shm) = self.shm {
                         shm.block().set_key_depressed(usage, pressed);
-                    }
-                    let input = Self::build_scancode_input(scancode, is_extended, pressed);
-                    unsafe {
-                        let _ = SendInput(&[input], size_of::<INPUT>() as i32);
                     }
                 }
             }
@@ -504,9 +582,7 @@ impl InputBackend for WindowsInputBackend {
                         },
                     },
                 };
-                unsafe {
-                    let _ = SendInput(&[input], size_of::<INPUT>() as i32);
-                }
+                send_inputs_checked(&[input])?;
             }
             HidEvent::MouseButton { button, pressed } => {
                 let (flags, mouse_data): (MOUSE_EVENT_FLAGS, u32) = match (button, pressed) {
@@ -534,9 +610,7 @@ impl InputBackend for WindowsInputBackend {
                         },
                     },
                 };
-                unsafe {
-                    let _ = SendInput(&[input], size_of::<INPUT>() as i32);
-                }
+                send_inputs_checked(&[input])?;
             }
             HidEvent::MouseWheel {
                 vertical,
@@ -573,11 +647,7 @@ impl InputBackend for WindowsInputBackend {
                         },
                     });
                 }
-                if !inputs.is_empty() {
-                    unsafe {
-                        let _ = SendInput(&inputs, size_of::<INPUT>() as i32);
-                    }
-                }
+                send_inputs_checked(&inputs)?;
             }
             HidEvent::ReleaseAllModifiers => {
                 self.release_all_stuck_keys()?;
@@ -608,11 +678,29 @@ impl InputBackend for WindowsInputBackend {
             }
         }
 
-        if !inputs.is_empty() {
-            unsafe {
-                let _ = SendInput(&inputs, size_of::<INPUT>() as i32);
-            }
+        // A watchdog/mode reset must also end an in-progress remote drag,
+        // including a pending tap whose delayed button-up never arrived.
+        for (flags, mouse_data) in [
+            (MOUSEEVENTF_LEFTUP, 0),
+            (MOUSEEVENTF_RIGHTUP, 0),
+            (MOUSEEVENTF_MIDDLEUP, 0),
+            (MOUSEEVENTF_XUP, u32::from(XBUTTON1)),
+            (MOUSEEVENTF_XUP, u32::from(XBUTTON2)),
+        ] {
+            inputs.push(INPUT {
+                r#type: INPUT_MOUSE,
+                Anonymous: INPUT_0 {
+                    mi: MOUSEINPUT {
+                        dwFlags: flags,
+                        mouseData: mouse_data,
+                        dwExtraInfo: DUPLEX_INJECTED_MAGIC,
+                        ..Default::default()
+                    },
+                },
+            });
         }
+
+        send_inputs_checked(&inputs)?;
         Ok(())
     }
 

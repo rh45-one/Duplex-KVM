@@ -45,6 +45,7 @@ const BTN_TOOL_TRIPLETAP: u16 = 0x14E;
 // Linux ioctl encodings for evdev ('E' = 0x45) and uinput ('U' = 0x55)
 const EVIOCGID: libc::c_ulong = 0x8008_4502;
 const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
+const EVIOCSCLOCKID: libc::c_ulong = 0x4004_45a0;
 
 const UI_DEV_CREATE: libc::c_ulong = 0x5501;
 const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
@@ -89,6 +90,7 @@ const fn eviocgbit(ev: u8, len: usize) -> libc::c_ulong {
 struct GrabbedEvdevDevice {
     fd: RawFd,
     path: String,
+    monotonic_events: bool,
 }
 
 impl GrabbedEvdevDevice {
@@ -118,9 +120,12 @@ impl GrabbedEvdevDevice {
             )));
         }
 
+        let clock = libc::CLOCK_MONOTONIC;
+        let monotonic_events = unsafe { libc::ioctl(fd, EVIOCSCLOCKID, &clock) } == 0;
         Ok(Self {
             fd,
             path: path.to_owned(),
+            monotonic_events,
         })
     }
 }
@@ -139,7 +144,7 @@ impl Drop for GrabbedEvdevDevice {
 pub struct LinuxUinputInjector {
     fd: RawFd,
     depressed: DepressedKeyBitmap,
-    shm: Option<Arc< crate::shm::ShmWatchdog >>,
+    shm: Option<Arc<crate::shm::ShmWatchdog>>,
 }
 
 impl LinuxUinputInjector {
@@ -160,7 +165,11 @@ impl LinuxUinputInjector {
 
         unsafe {
             // Enable EV_SYN, EV_KEY, EV_REL
-            for ev in [EV_SYN as libc::c_int, EV_KEY as libc::c_int, EV_REL as libc::c_int] {
+            for ev in [
+                EV_SYN as libc::c_int,
+                EV_KEY as libc::c_int,
+                EV_REL as libc::c_int,
+            ] {
                 if libc::ioctl(fd, UI_SET_EVBIT, ev) < 0 {
                     let err = std::io::Error::last_os_error();
                     libc::close(fd);
@@ -340,8 +349,217 @@ impl Drop for LinuxUinputInjector {
     }
 }
 
-/// Complete Debian Linux `InputBackend` combining non-blocking `epoll` + `evdev` (`EVIOCGRAB`)
-/// capture and `/dev/uinput` kernel injection.
+/// Gesture state, independent of device I/O so timing boundaries can be tested.
+#[derive(Default)]
+struct TouchpadState {
+    touch_active: bool,
+    two_finger: bool,
+    last_x: Option<i32>,
+    last_y: Option<i32>,
+    scroll_x_rem: i32,
+    scroll_y_rem: i32,
+    touch_start_ns: u64,
+    tap_motion: i32,
+    max_fingers: u8,
+    last_tap_release_ns: u64,
+    dragging: bool,
+    suppress_tap: bool,
+    start_x: Option<i32>,
+    start_y: Option<i32>,
+    tolerance_x: i32,
+    tolerance_y: i32,
+}
+
+impl TouchpadState {
+    fn advance_time(&mut self, now_ns: u64, out: &mut Vec<CapturedInputEvent>) {
+        if self.last_tap_release_ns > 0
+            && !self.dragging
+            && now_ns.saturating_sub(self.last_tap_release_ns) > 280_000_000
+        {
+            self.last_tap_release_ns = 0;
+            out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                button: HidMouseButton::Left,
+                pressed: false,
+            }));
+        }
+    }
+
+    fn configure_resolution(&mut self, fd: RawFd) {
+        // EVIOCGABS reports input_absinfo, including units per millimetre.
+        for (axis, tolerance) in [
+            (ABS_X, &mut self.tolerance_x),
+            (ABS_Y, &mut self.tolerance_y),
+        ] {
+            let mut info = [0i32; 6];
+            if unsafe { libc::ioctl(fd, 0x8018_4540u64 + u64::from(axis), info.as_mut_ptr()) } == 0
+            {
+                *tolerance = info[5].saturating_mul(3).max(45);
+            }
+        }
+    }
+
+    fn observe_position(&mut self, axis: u16, value: i32) -> Option<i32> {
+        let (start, last, tolerance) = if axis == ABS_X {
+            (
+                &mut self.start_x,
+                &mut self.last_x,
+                self.tolerance_x.max(45),
+            )
+        } else {
+            (
+                &mut self.start_y,
+                &mut self.last_y,
+                self.tolerance_y.max(45),
+            )
+        };
+        let origin = *start.get_or_insert(value);
+        // Measure the furthest displacement, rather than summing sensor jitter.
+        let normalized = ((i64::from(value) - i64::from(origin)).abs() * 45 / i64::from(tolerance))
+            .min(i64::from(i32::MAX)) as i32;
+        self.tap_motion = self.tap_motion.max(normalized);
+        last.replace(value)
+            .map(|previous| value.saturating_sub(previous))
+    }
+
+    /// Normalizes tap/drag transitions without accessing evdev or uinput.
+    fn handle_key(
+        &mut self,
+        code: u16,
+        pressed: bool,
+        now_ns: u64,
+        out: &mut Vec<CapturedInputEvent>,
+    ) -> bool {
+        self.advance_time(now_ns, out);
+        if code == BTN_TOUCH {
+            if self.touch_active == pressed {
+                return true;
+            }
+            if pressed {
+                self.suppress_tap = false;
+                self.touch_active = true;
+                self.touch_start_ns = now_ns;
+                self.tap_motion = 0;
+                self.start_x = None;
+                self.start_y = None;
+                self.last_x = None;
+                self.last_y = None;
+                if self.max_fingers == 0 {
+                    self.max_fingers = 1;
+                }
+
+                // Tap-and-hold (tap-to-drag): check if this touch-down arrived within
+                // 280ms of a preceding single-finger tap release
+                let time_since_last_tap = now_ns.saturating_sub(self.last_tap_release_ns);
+                if self.last_tap_release_ns > 0
+                    && time_since_last_tap <= 280_000_000
+                    && !self.two_finger
+                {
+                    self.dragging = true;
+                    self.last_tap_release_ns = 0;
+                    debug!("Trackpad tap-to-drag started");
+                    // The first tap's button is still down. Sending a second
+                    // down here makes Windows dispatch WM_LBUTTONDBLCLK and
+                    // applications maximize/open instead of starting a drag.
+                }
+            } else {
+                if self.dragging {
+                    debug!("Trackpad tap-to-drag released");
+                    self.dragging = false;
+                    self.last_tap_release_ns = 0;
+                    out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                        button: HidMouseButton::Left,
+                        pressed: false,
+                    }));
+                    if now_ns.saturating_sub(self.touch_start_ns) <= 180_000_000
+                        && self.tap_motion < 45
+                    {
+                        // Two short taps are still a double click. A held or
+                        // moved second contact is one continuous button press.
+                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                            button: HidMouseButton::Left,
+                            pressed: true,
+                        }));
+                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                            button: HidMouseButton::Left,
+                            pressed: false,
+                        }));
+                    }
+                } else {
+                    // Tap duration and displacement are independent of report rate.
+                    let dur_ns = now_ns.saturating_sub(self.touch_start_ns);
+                    if self.touch_active
+                        && !self.suppress_tap
+                        && dur_ns <= 180_000_000
+                        && self.tap_motion < 45
+                    {
+                        let btn = if self.max_fingers >= 2 {
+                            HidMouseButton::Right
+                        } else {
+                            HidMouseButton::Left
+                        };
+                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                            button: btn,
+                            pressed: true,
+                        }));
+                        if btn == HidMouseButton::Left {
+                            // Defer release during the drag decision window.
+                            // A second touch continues this same button press.
+                            debug!("Trackpad single tap accepted; drag armed");
+                            self.last_tap_release_ns = now_ns;
+                        } else {
+                            out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                                button: btn,
+                                pressed: false,
+                            }));
+                            self.last_tap_release_ns = 0;
+                        }
+                    } else {
+                        self.last_tap_release_ns = 0;
+                    }
+                }
+                self.touch_active = false;
+                self.last_x = None;
+                self.last_y = None;
+                self.scroll_x_rem = 0;
+                self.scroll_y_rem = 0;
+                self.max_fingers = 0;
+            }
+            return true;
+        }
+
+        if code == BTN_TOOL_DOUBLETAP {
+            self.two_finger = pressed;
+            if pressed && (self.dragging || self.last_tap_release_ns > 0) {
+                self.suppress_tap = true;
+                self.dragging = false;
+                self.last_tap_release_ns = 0;
+                out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
+                    button: HidMouseButton::Left,
+                    pressed: false,
+                }));
+            }
+            // Reset reference coordinates when switching between 1-finger and 2-finger
+            self.last_x = None;
+            self.last_y = None;
+            self.scroll_x_rem = 0;
+            self.scroll_y_rem = 0;
+            if pressed {
+                self.max_fingers = self.max_fingers.max(2);
+            }
+            return true;
+        }
+
+        if code == BTN_TOOL_TRIPLETAP {
+            if pressed {
+                self.max_fingers = self.max_fingers.max(3);
+            }
+            return true;
+        }
+
+        false
+    }
+}
+
 pub struct LinuxInputBackend {
     epoll_fd: RawFd,
     passive_epoll_fd: RawFd,
@@ -354,17 +572,7 @@ pub struct LinuxInputBackend {
     rel_dy_accum: i16,
     rel_vwheel_accum: i16,
     rel_hwheel_accum: i16,
-    touchpad_touch_active: bool,
-    touchpad_two_finger: bool,
-    touchpad_last_x: Option<i32>,
-    touchpad_last_y: Option<i32>,
-    touchpad_scroll_x_rem: i32,
-    touchpad_scroll_y_rem: i32,
-    touchpad_touch_start_ns: u64,
-    touchpad_tap_motion: i32,
-    touchpad_max_fingers: u8,
-    touchpad_last_tap_release_ns: u64,
-    touchpad_dragging: bool,
+    touchpad: TouchpadState,
     last_hotkey_ns: u64,
 }
 
@@ -400,17 +608,7 @@ impl LinuxInputBackend {
             rel_dy_accum: 0,
             rel_vwheel_accum: 0,
             rel_hwheel_accum: 0,
-            touchpad_touch_active: false,
-            touchpad_two_finger: false,
-            touchpad_last_x: None,
-            touchpad_last_y: None,
-            touchpad_scroll_x_rem: 0,
-            touchpad_scroll_y_rem: 0,
-            touchpad_touch_start_ns: 0,
-            touchpad_tap_motion: 0,
-            touchpad_max_fingers: 0,
-            touchpad_last_tap_release_ns: 0,
-            touchpad_dragging: false,
+            touchpad: TouchpadState::default(),
             last_hotkey_ns: 0,
         };
         backend.open_passive_hotkey_listeners();
@@ -558,9 +756,7 @@ impl LinuxInputBackend {
                 to = ?target,
                 "Global keyboard shortcut (Ctrl+Alt+P / Ctrl+Alt+0..3) triggered mode switch"
             );
-            block
-                .requested_mode
-                .store(target.as_u8(), Ordering::SeqCst);
+            block.requested_mode.store(target.as_u8(), Ordering::SeqCst);
         }
     }
 
@@ -582,16 +778,14 @@ impl LinuxInputBackend {
 
         let mut id = LinuxInputId::default();
         let rc = unsafe { libc::ioctl(fd, EVIOCGID, &mut id as *mut LinuxInputId) };
-        if rc == 0
-            && id.vendor == DUPLEX_UINPUT_VENDOR
-            && id.product == DUPLEX_UINPUT_PRODUCT
-        {
+        if rc == 0 && id.vendor == DUPLEX_UINPUT_VENDOR && id.product == DUPLEX_UINPUT_PRODUCT {
             unsafe { libc::close(fd) };
             return false; // Skip our own virtual uinput device!
         }
 
         let mut ev_bits = [0u8; 4];
-        let has_ev = unsafe { libc::ioctl(fd, eviocgbit(0, ev_bits.len()), ev_bits.as_mut_ptr()) } >= 0;
+        let has_ev =
+            unsafe { libc::ioctl(fd, eviocgbit(0, ev_bits.len()), ev_bits.as_mut_ptr()) } >= 0;
         if !has_ev {
             unsafe { libc::close(fd) };
             return false;
@@ -609,7 +803,7 @@ impl LinuxInputBackend {
             )
         };
         // Check if device has KEY_ESC (1) and KEY_ENTER (28) -> keyboard, or BTN_LEFT (0x110) -> mouse/trackpad
-        let has_esc = (key_bits[1 / 8] & (1 << (1 % 8))) != 0;
+        let has_esc = (key_bits[1 / 8] & (1 << 1)) != 0;
         let has_enter = (key_bits[28 / 8] & (1 << (28 % 8))) != 0;
         let has_btn_left = (key_bits[BTN_LEFT as usize / 8] & (1 << (BTN_LEFT as usize % 8))) != 0;
 
@@ -629,17 +823,10 @@ impl LinuxInputBackend {
     }
 
     fn reset_touchpad_state(&mut self) {
-        self.touchpad_touch_active = false;
-        self.touchpad_two_finger = false;
-        self.touchpad_last_x = None;
-        self.touchpad_last_y = None;
-        self.touchpad_scroll_x_rem = 0;
-        self.touchpad_scroll_y_rem = 0;
-        self.touchpad_touch_start_ns = 0;
-        self.touchpad_tap_motion = 0;
-        self.touchpad_max_fingers = 0;
-        self.touchpad_last_tap_release_ns = 0;
-        self.touchpad_dragging = false;
+        let (tolerance_x, tolerance_y) = (self.touchpad.tolerance_x, self.touchpad.tolerance_y);
+        self.touchpad = TouchpadState::default();
+        self.touchpad.tolerance_x = tolerance_x;
+        self.touchpad.tolerance_y = tolerance_y;
     }
 }
 
@@ -680,6 +867,7 @@ impl InputBackend for LinuxInputBackend {
                         )
                     };
                     if rc == 0 {
+                        self.touchpad.configure_resolution(dev.fd);
                         info!(device = %path, fd = dev.fd, "Acquired exclusive EVIOCGRAB on evdev device");
                         self.grabbed_devices.push(dev);
                     }
@@ -688,6 +876,13 @@ impl InputBackend for LinuxInputBackend {
                     warn!(device = %path, error = %e, "Skipping evdev device grab");
                 }
             }
+        }
+
+        if self.grabbed_devices.is_empty() {
+            self.open_passive_hotkey_listeners();
+            return Err(PalError::Input(
+                "No keyboard, mouse or trackpad could be captured. Check /dev/input/event* permissions and membership in the input group; sign out and back in after network/input setup.".into(),
+            ));
         }
 
         if let Some(ref shm) = self.shm {
@@ -743,7 +938,9 @@ impl InputBackend for LinuxInputBackend {
         };
 
         if ready <= 0 {
-            return Ok(0);
+            let before = out.len();
+            self.touchpad.advance_time(monotonic_now_ns(), out);
+            return Ok(out.len() - before);
         }
 
         let now_ns = monotonic_now_ns();
@@ -761,6 +958,10 @@ impl InputBackend for LinuxInputBackend {
 
         for item in epoll_events.iter().take(ready as usize) {
             let fd = item.u64 as RawFd;
+            let monotonic_events = self
+                .grabbed_devices
+                .iter()
+                .any(|device| device.fd == fd && device.monotonic_events);
             loop {
                 let bytes_read = unsafe {
                     libc::read(
@@ -775,6 +976,13 @@ impl InputBackend for LinuxInputBackend {
 
                 let count = (bytes_read as usize) / core::mem::size_of::<libc::input_event>();
                 for ev in &raw_buf[..count] {
+                    let event_ns = if monotonic_events {
+                        (ev.time.tv_sec as u64)
+                            .saturating_mul(1_000_000_000)
+                            .saturating_add((ev.time.tv_usec as u64).saturating_mul(1000))
+                    } else {
+                        now_ns
+                    };
                     match ev.type_ {
                         EV_KEY => {
                             // Ignore value == 2 (kernel key auto-repeat) for wire normalization
@@ -783,107 +991,10 @@ impl InputBackend for LinuxInputBackend {
                             }
                             let pressed = ev.value == 1;
 
-                            if ev.code == BTN_TOUCH {
-                                if pressed {
-                                    self.touchpad_touch_active = true;
-                                    self.touchpad_touch_start_ns = now_ns;
-                                    self.touchpad_tap_motion = 0;
-                                    if self.touchpad_max_fingers == 0 {
-                                        self.touchpad_max_fingers = 1;
-                                    }
-
-                                    // Tap-and-hold (tap-to-drag): check if this touch-down arrived within
-                                    // 280ms of a preceding single-finger tap release
-                                    let time_since_last_tap =
-                                        now_ns.saturating_sub(self.touchpad_last_tap_release_ns);
-                                    if self.touchpad_last_tap_release_ns > 0
-                                        && time_since_last_tap <= 280_000_000
-                                        && !self.touchpad_two_finger
-                                    {
-                                        self.touchpad_dragging = true;
-                                        self.touchpad_last_tap_release_ns = 0;
-                                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                            button: HidMouseButton::Left,
-                                            pressed: true,
-                                        }));
-                                        pushed += 1;
-                                    }
-                                } else {
-                                    if self.touchpad_dragging {
-                                        self.touchpad_dragging = false;
-                                        self.touchpad_last_tap_release_ns = 0;
-                                        out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                            button: HidMouseButton::Left,
-                                            pressed: false,
-                                        }));
-                                        pushed += 1;
-                                    } else {
-                                        // Check for tap-to-click (<180ms and <45 units of finger travel)
-                                        let dur_ns =
-                                            now_ns.saturating_sub(self.touchpad_touch_start_ns);
-                                        if self.touchpad_touch_active
-                                            && dur_ns <= 180_000_000
-                                            && self.touchpad_tap_motion < 45
-                                        {
-                                            let btn = if self.touchpad_max_fingers >= 2 {
-                                                HidMouseButton::Right
-                                            } else {
-                                                HidMouseButton::Left
-                                            };
-                                            out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                                button: btn,
-                                                pressed: true,
-                                            }));
-                                            out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                                button: btn,
-                                                pressed: false,
-                                            }));
-                                            pushed += 2;
-                                            if btn == HidMouseButton::Left {
-                                                self.touchpad_last_tap_release_ns = now_ns;
-                                            } else {
-                                                self.touchpad_last_tap_release_ns = 0;
-                                            }
-                                        } else {
-                                            self.touchpad_last_tap_release_ns = 0;
-                                        }
-                                    }
-                                    self.touchpad_touch_active = false;
-                                    self.touchpad_last_x = None;
-                                    self.touchpad_last_y = None;
-                                    self.touchpad_scroll_x_rem = 0;
-                                    self.touchpad_scroll_y_rem = 0;
-                                    self.touchpad_max_fingers = 0;
-                                }
-                                continue;
-                            }
-
-                            if ev.code == BTN_TOOL_DOUBLETAP {
-                                self.touchpad_two_finger = pressed;
-                                if pressed && self.touchpad_dragging {
-                                    self.touchpad_dragging = false;
-                                    self.touchpad_last_tap_release_ns = 0;
-                                    out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
-                                        button: HidMouseButton::Left,
-                                        pressed: false,
-                                    }));
-                                    pushed += 1;
-                                }
-                                // Reset reference coordinates when switching between 1-finger and 2-finger
-                                self.touchpad_last_x = None;
-                                self.touchpad_last_y = None;
-                                self.touchpad_scroll_x_rem = 0;
-                                self.touchpad_scroll_y_rem = 0;
-                                if pressed {
-                                    self.touchpad_max_fingers = self.touchpad_max_fingers.max(2);
-                                }
-                                continue;
-                            }
-
-                            if ev.code == BTN_TOOL_TRIPLETAP {
-                                if pressed {
-                                    self.touchpad_max_fingers = self.touchpad_max_fingers.max(3);
-                                }
+                            let before = out.len();
+                            let handled = self.touchpad.handle_key(ev.code, pressed, event_ns, out);
+                            pushed += out.len() - before;
+                            if handled {
                                 continue;
                             }
 
@@ -898,9 +1009,18 @@ impl InputBackend for LinuxInputBackend {
                             };
 
                             if let Some(button) = mouse_btn {
-                                if self.touchpad_dragging && button == HidMouseButton::Left {
-                                    self.touchpad_dragging = false;
-                                    self.touchpad_last_tap_release_ns = 0;
+                                if button == HidMouseButton::Left
+                                    && (self.touchpad.dragging
+                                        || self.touchpad.last_tap_release_ns > 0)
+                                {
+                                    self.touchpad.suppress_tap = true;
+                                    self.touchpad.dragging = false;
+                                    self.touchpad.last_tap_release_ns = 0;
+                                    if pressed {
+                                        // The physical click takes over the
+                                        // already held synthetic button.
+                                        continue;
+                                    }
                                 }
                                 out.push(CapturedInputEvent::Hid(HidEvent::MouseButton {
                                     button,
@@ -915,7 +1035,10 @@ impl InputBackend for LinuxInputBackend {
                                 if let Some(trigger_kind) =
                                     self.panic_detector.observe_key(usage, pressed, now_ns)
                                 {
-                                    warn!(?trigger_kind, "HARDWARE PANIC ESCAPE HATCH TRIPPED ON LINUX EVDEV");
+                                    warn!(
+                                        ?trigger_kind,
+                                        "HARDWARE PANIC ESCAPE HATCH TRIPPED ON LINUX EVDEV"
+                                    );
                                     self.emergency_panic_release()?;
                                     // Flush remote modifiers on the peer before disconnecting to Mode0Idle
                                     out.push(CapturedInputEvent::Hid(
@@ -962,21 +1085,20 @@ impl InputBackend for LinuxInputBackend {
                         },
                         EV_ABS => match ev.code {
                             ABS_X => {
-                                if self.touchpad_touch_active || self.touchpad_two_finger {
-                                    if let Some(prev_x) = self.touchpad_last_x {
-                                        let raw_dx = ev.value - prev_x;
-                                        self.touchpad_tap_motion =
-                                            self.touchpad_tap_motion.saturating_add(raw_dx.abs());
-                                        if self.touchpad_two_finger {
-                                            self.touchpad_scroll_x_rem =
-                                                self.touchpad_scroll_x_rem.saturating_add(raw_dx);
-                                            let ticks = (self.touchpad_scroll_x_rem / 32)
+                                if self.touchpad.touch_active || self.touchpad.two_finger {
+                                    if let Some(raw_dx) =
+                                        self.touchpad.observe_position(ABS_X, ev.value)
+                                    {
+                                        if self.touchpad.two_finger {
+                                            self.touchpad.scroll_x_rem =
+                                                self.touchpad.scroll_x_rem.saturating_add(raw_dx);
+                                            let ticks = (self.touchpad.scroll_x_rem / 32)
                                                 .clamp(i16::MIN as i32, i16::MAX as i32)
                                                 as i16;
                                             if ticks != 0 {
                                                 self.rel_hwheel_accum =
                                                     self.rel_hwheel_accum.saturating_sub(ticks);
-                                                self.touchpad_scroll_x_rem %= 32;
+                                                self.touchpad.scroll_x_rem %= 32;
                                             }
                                         } else {
                                             let delta = (raw_dx / 2)
@@ -986,26 +1108,24 @@ impl InputBackend for LinuxInputBackend {
                                                 self.rel_dx_accum.saturating_add(delta);
                                         }
                                     }
-                                    self.touchpad_last_x = Some(ev.value);
                                 }
                             }
-                            ABS_Y => {
-                                if self.touchpad_touch_active || self.touchpad_two_finger {
-                                    if let Some(prev_y) = self.touchpad_last_y {
-                                        let raw_dy = ev.value - prev_y;
-                                        self.touchpad_tap_motion =
-                                            self.touchpad_tap_motion.saturating_add(raw_dy.abs());
-                                        if self.touchpad_two_finger {
-                                            self.touchpad_scroll_y_rem =
-                                                self.touchpad_scroll_y_rem.saturating_add(raw_dy);
-                                            let ticks = (self.touchpad_scroll_y_rem / 28)
+                            ABS_Y
+                                if (self.touchpad.touch_active || self.touchpad.two_finger) => {
+                                    if let Some(raw_dy) =
+                                        self.touchpad.observe_position(ABS_Y, ev.value)
+                                    {
+                                        if self.touchpad.two_finger {
+                                            self.touchpad.scroll_y_rem =
+                                                self.touchpad.scroll_y_rem.saturating_add(raw_dy);
+                                            let ticks = (self.touchpad.scroll_y_rem / 28)
                                                 .clamp(i16::MIN as i32, i16::MAX as i32)
                                                 as i16;
                                             if ticks != 0 {
                                                 // Natural two-finger scrolling: moving fingers up (raw_dy < 0) scrolls down (negative wheel)
                                                 self.rel_vwheel_accum =
                                                     self.rel_vwheel_accum.saturating_add(ticks);
-                                                self.touchpad_scroll_y_rem %= 28;
+                                                self.touchpad.scroll_y_rem %= 28;
                                             }
                                         } else {
                                             let delta = (raw_dy / 2)
@@ -1015,9 +1135,7 @@ impl InputBackend for LinuxInputBackend {
                                                 self.rel_dy_accum.saturating_add(delta);
                                         }
                                     }
-                                    self.touchpad_last_y = Some(ev.value);
                                 }
-                            }
                             _ => {}
                         },
                         EV_SYN if ev.code == SYN_REPORT => {
@@ -1046,7 +1164,9 @@ impl InputBackend for LinuxInputBackend {
             }
         }
 
-        Ok(pushed)
+        let before = out.len();
+        self.touchpad.advance_time(monotonic_now_ns(), out);
+        Ok(pushed + out.len() - before)
     }
 
     fn inject_hid_event(&mut self, event: &HidEvent) -> Result<(), PalError> {
@@ -1090,5 +1210,188 @@ impl Drop for LinuxInputBackend {
                 let _ = libc::close(self.passive_epoll_fd);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(state: &mut TouchpadState, code: u16, down: bool, ms: u64) -> Vec<HidEvent> {
+        let mut events = Vec::new();
+        assert!(state.handle_key(code, down, ms * 1_000_000, &mut events));
+        events
+            .into_iter()
+            .map(|ev| match ev {
+                CapturedInputEvent::Hid(ev) => ev,
+                _ => panic!("gesture emitted panic"),
+            })
+            .collect()
+    }
+
+    fn button(button: HidMouseButton, pressed: bool) -> HidEvent {
+        HidEvent::MouseButton { button, pressed }
+    }
+
+    fn tap(state: &mut TouchpadState) {
+        assert!(key(state, BTN_TOUCH, true, 1000).is_empty());
+        assert_eq!(
+            key(state, BTN_TOUCH, false, 1100),
+            vec![button(HidMouseButton::Left, true)]
+        );
+    }
+
+    #[test]
+    fn tap_then_hold_drags_until_lift_without_extra_click() {
+        let mut state = TouchpadState::default();
+        tap(&mut state);
+        assert!(key(&mut state, BTN_TOUCH, true, 1300).is_empty());
+        state.tap_motion = 200;
+        assert_eq!(
+            key(&mut state, BTN_TOUCH, false, 3000),
+            vec![button(HidMouseButton::Left, false)]
+        );
+        assert!(!state.dragging);
+        assert_eq!(state.last_tap_release_ns, 0);
+        assert!(key(&mut state, BTN_TOUCH, false, 3001).is_empty());
+    }
+
+    #[test]
+    fn drag_time_boundary_is_280ms() {
+        for (down_ms, expected_drag) in [(1380, true), (1381, false)] {
+            let mut state = TouchpadState::default();
+            tap(&mut state);
+            let events = key(&mut state, BTN_TOUCH, true, down_ms);
+            assert_eq!(state.dragging, expected_drag);
+            assert_eq!(
+                events,
+                if expected_drag {
+                    Vec::new()
+                } else {
+                    vec![button(HidMouseButton::Left, false)]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn single_tap_releases_after_timeout_without_another_device_event() {
+        let mut state = TouchpadState::default();
+        tap(&mut state);
+        let mut events = Vec::new();
+        state.advance_time(1_380_000_000, &mut events);
+        assert!(events.is_empty());
+        state.advance_time(1_381_000_000, &mut events);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            events[0],
+            CapturedInputEvent::Hid(HidEvent::MouseButton {
+                button: HidMouseButton::Left,
+                pressed: false
+            })
+        ));
+        state.advance_time(2_000_000_000, &mut events);
+        assert_eq!(events.len(), 1, "release must be emitted exactly once");
+    }
+
+    #[test]
+    fn double_tap_still_produces_two_clicks_but_held_contact_does_not() {
+        for (second_lift, expected_clicks) in [(1300, 2), (1600, 1)] {
+            let mut state = TouchpadState::default();
+            let mut events = key(&mut state, BTN_TOUCH, true, 1000);
+            events.extend(key(&mut state, BTN_TOUCH, false, 1100));
+            events.extend(key(&mut state, BTN_TOUCH, true, 1200));
+            events.extend(key(&mut state, BTN_TOUCH, false, second_lift));
+            let mut expected = Vec::new();
+            for _ in 0..expected_clicks {
+                expected.extend([
+                    button(HidMouseButton::Left, true),
+                    button(HidMouseButton::Left, false),
+                ]);
+            }
+            assert_eq!(events, expected);
+        }
+    }
+
+    #[test]
+    fn sensor_jitter_does_not_cancel_a_short_tap_and_drag() {
+        let mut state = TouchpadState {
+            tolerance_x: 93,
+            tolerance_y: 93,
+            ..Default::default()
+        };
+        key(&mut state, BTN_TOUCH, true, 1000);
+        for _ in 0..40 {
+            state.observe_position(ABS_X, 1500);
+            state.observe_position(ABS_X, 1503);
+            state.observe_position(ABS_Y, 800);
+            state.observe_position(ABS_Y, 804);
+        }
+        assert_eq!(key(&mut state, BTN_TOUCH, false, 1080).len(), 1);
+        assert!(key(&mut state, BTN_TOUCH, true, 1200).is_empty());
+        state.observe_position(ABS_X, 1800);
+        state.observe_position(ABS_X, 2400);
+        assert_eq!(
+            key(&mut state, BTN_TOUCH, false, 2100),
+            vec![button(HidMouseButton::Left, false)]
+        );
+    }
+
+    #[test]
+    fn excursion_beyond_physical_tap_tolerance_cannot_arm_drag() {
+        let mut state = TouchpadState {
+            tolerance_x: 93,
+            tolerance_y: 93,
+            ..Default::default()
+        };
+        key(&mut state, BTN_TOUCH, true, 1000);
+        state.observe_position(ABS_X, 1000);
+        state.observe_position(ABS_X, 1093);
+        state.observe_position(ABS_X, 1000);
+        assert!(key(&mut state, BTN_TOUCH, false, 1080).is_empty());
+        assert!(key(&mut state, BTN_TOUCH, true, 1200).is_empty());
+        assert!(!state.dragging);
+    }
+
+    #[test]
+    fn long_or_moving_touch_cannot_arm_drag() {
+        for (duration, motion) in [(181, 0), (100, 45), (100, 300)] {
+            let mut state = TouchpadState::default();
+            key(&mut state, BTN_TOUCH, true, 1000);
+            state.tap_motion = motion;
+            assert!(key(&mut state, BTN_TOUCH, false, 1000 + duration).is_empty());
+            assert!(key(&mut state, BTN_TOUCH, true, 1250).is_empty());
+            assert!(!state.dragging);
+        }
+    }
+
+    #[test]
+    fn two_finger_tap_right_clicks_without_arming_drag() {
+        let mut state = TouchpadState::default();
+        key(&mut state, BTN_TOOL_DOUBLETAP, true, 1000);
+        key(&mut state, BTN_TOUCH, true, 1000);
+        key(&mut state, BTN_TOOL_DOUBLETAP, false, 1090);
+        assert_eq!(
+            key(&mut state, BTN_TOUCH, false, 1100),
+            vec![
+                button(HidMouseButton::Right, true),
+                button(HidMouseButton::Right, false)
+            ]
+        );
+        assert!(key(&mut state, BTN_TOUCH, true, 1200).is_empty());
+        assert!(!state.dragging);
+    }
+
+    #[test]
+    fn adding_second_finger_releases_drag_without_spurious_tap() {
+        let mut state = TouchpadState::default();
+        tap(&mut state);
+        key(&mut state, BTN_TOUCH, true, 1200);
+        assert_eq!(
+            key(&mut state, BTN_TOOL_DOUBLETAP, true, 1210),
+            vec![button(HidMouseButton::Left, false)]
+        );
+        assert!(key(&mut state, BTN_TOUCH, false, 1250).is_empty());
+        assert!(!state.dragging);
     }
 }

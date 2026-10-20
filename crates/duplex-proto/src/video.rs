@@ -1,13 +1,12 @@
-//! Low-Latency Hardware Video Framing (`HEVC` / `VA-API` / `NVENC` / `D3D11VA`) & Decoupled Hardware Cursor.
-//!
-//! Enforces the 60 Mbps CBR/tight-VBR cap per virtual monitor (`DSCP AF41` / `IP_TOS 0x88`)
-//! on UDP ports `48102` (Monitor 0) and `48103` (Monitor 1), MTU-safe fragmentation (`1380` bytes/chunk),
-//! and sub-millisecond decoupled hardware cursor updates.
+//! Video unit framing for UDP ports `48102` (monitor 0) and `48103` (monitor 1)
+//! (`DSCP AF41` / `IP_TOS 0x88`): MTU-safe fragmentation (`1380` bytes/chunk),
+//! reassembly with loss detection, and the legacy DPXB band codec. The current
+//! stream format is DPXT (see `tile_codec`); DPXC/DPXB remain for old peers.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// Strict per-monitor bitrate ceiling: 60 Mbps (60,000 kbps) CBR / tight-VBR.
+/// Per-frame budget basis for the legacy DPXC band encoder (60 Mbit/s).
 pub const MAX_VIDEO_BITRATE_KBPS: u32 = 60_000;
 
 /// Wire magic `"DPXV"` for UDP video stream datagrams on ports 48102..=48103.
@@ -32,6 +31,10 @@ pub enum VideoCodec {
     Hevc = 1,
     /// ITU-T H.264 / AVC fallback.
     H264 = 2,
+    /// Native full-colour desktop bands, compressed independently with zlib.
+    DesktopLossless = 3,
+    /// DPXT tiles: lossless/JPEG 64×64 tiles with lossless refinement.
+    Tiles = 4,
 }
 
 impl VideoCodec {
@@ -39,6 +42,8 @@ impl VideoCodec {
     pub const fn from_u8(val: u8) -> Self {
         match val {
             2 => Self::H264,
+            3 => Self::DesktopLossless,
+            4 => Self::Tiles,
             _ => Self::Hevc,
         }
     }
@@ -149,45 +154,65 @@ impl VideoFragmentHeader {
     }
 }
 
-/// Splits an `EncodedVideoFrame` into MTU-safe (`<= 1404` byte) UDP datagrams.
-pub fn packetize_video_frame(frame: &EncodedVideoFrame, out_datagrams: &mut Vec<Vec<u8>>) {
-    out_datagrams.clear();
-    let chunks: Vec<&[u8]> = if frame.data.is_empty() {
-        vec![&[]]
-    } else {
-        frame.data.chunks(MAX_VIDEO_FRAGMENT_PAYLOAD).collect()
-    };
-
-    let fragment_count = chunks.len().min(u16::MAX as usize) as u16;
-    for (idx, chunk) in chunks.into_iter().take(fragment_count as usize).enumerate() {
+/// Builds each MTU-safe (`<= 1404` byte) datagram of `frame` in `scratch`
+/// and passes it to `emit`, without allocating per datagram. Stops early and
+/// returns false when `emit` returns false.
+pub fn emit_video_datagrams(
+    frame: &EncodedVideoFrame,
+    scratch: &mut Vec<u8>,
+    mut emit: impl FnMut(&[u8]) -> bool,
+) -> bool {
+    let fragment_count = frame
+        .data
+        .len()
+        .div_ceil(MAX_VIDEO_FRAGMENT_PAYLOAD)
+        .clamp(1, usize::from(u16::MAX));
+    for index in 0..fragment_count {
+        let start = index * MAX_VIDEO_FRAGMENT_PAYLOAD;
+        let chunk = &frame.data[start.min(frame.data.len())..(start + MAX_VIDEO_FRAGMENT_PAYLOAD).min(frame.data.len())];
         let mut flags = if frame.is_keyframe {
             VIDEO_FLAG_KEYFRAME_IDR
         } else {
             0
         };
-        if idx + 1 == (fragment_count as usize) {
+        if index + 1 == fragment_count {
             flags |= VIDEO_FLAG_END_OF_FRAME;
         }
-
-        let hdr = VideoFragmentHeader {
+        let header = VideoFragmentHeader {
             monitor_index: frame.monitor_index,
             codec: frame.codec,
             flags,
-            fragment_index: idx as u16,
-            fragment_count,
+            fragment_index: index as u16,
+            fragment_count: fragment_count as u16,
             frame_seq: frame.frame_seq,
             capture_timestamp_ns: frame.capture_timestamp_ns,
             payload_len: chunk.len() as u16,
         };
-
-        let mut dgram = Vec::with_capacity(VIDEO_FRAGMENT_HEADER_LEN + chunk.len());
-        let mut hdr_bytes = [0u8; VIDEO_FRAGMENT_HEADER_LEN];
-        hdr.write_to_slice(&mut hdr_bytes);
-        dgram.extend_from_slice(&hdr_bytes);
-        dgram.extend_from_slice(chunk);
-        out_datagrams.push(dgram);
+        let mut header_bytes = [0u8; VIDEO_FRAGMENT_HEADER_LEN];
+        header.write_to_slice(&mut header_bytes);
+        scratch.clear();
+        scratch.extend_from_slice(&header_bytes);
+        scratch.extend_from_slice(chunk);
+        if !emit(scratch) {
+            return false;
+        }
     }
+    true
 }
+
+/// Splits an `EncodedVideoFrame` into MTU-safe (`<= 1404` byte) UDP datagrams.
+pub fn packetize_video_frame(frame: &EncodedVideoFrame, out_datagrams: &mut Vec<Vec<u8>>) {
+    out_datagrams.clear();
+    let mut scratch = Vec::with_capacity(VIDEO_FRAGMENT_HEADER_LEN + MAX_VIDEO_FRAGMENT_PAYLOAD);
+    emit_video_datagrams(frame, &mut scratch, |datagram| {
+        out_datagrams.push(datagram.to_vec());
+        true
+    });
+}
+
+/// Units this far behind the newest sequence are late duplicates; anything
+/// further behind means the sender restarted its numbering.
+const STALE_SEQUENCE_WINDOW: u32 = 1024;
 
 /// Per-monitor UDP video frame reassembler with automatic gap / packet-loss detection (PLI).
 pub struct VideoFrameAssembler {
@@ -198,7 +223,9 @@ pub struct VideoFrameAssembler {
     is_keyframe: bool,
     codec: VideoCodec,
     capture_timestamp_ns: u64,
-    slots: Vec<Option<Vec<u8>>>,
+    received: Vec<bool>,
+    data: Vec<u8>,
+    last_fragment_len: usize,
     last_completed_seq: Option<u32>,
 }
 
@@ -212,7 +239,9 @@ impl VideoFrameAssembler {
             is_keyframe: false,
             codec: VideoCodec::Hevc,
             capture_timestamp_ns: 0,
-            slots: Vec::with_capacity(64),
+            received: Vec::with_capacity(64),
+            data: Vec::new(),
+            last_fragment_len: 0,
             last_completed_seq: None,
         }
     }
@@ -225,8 +254,29 @@ impl VideoFrameAssembler {
         datagram: &[u8],
     ) -> Result<(Option<EncodedVideoFrame>, bool), VideoPacketError> {
         let (hdr, payload) = VideoFragmentHeader::parse_from_datagram(datagram)?;
-        if hdr.monitor_index != self.monitor_index || hdr.fragment_count == 0 {
+        if hdr.monitor_index != self.monitor_index
+            || hdr.fragment_count == 0
+            || hdr.fragment_index >= hdr.fragment_count
+            || payload.len() > MAX_VIDEO_FRAGMENT_PAYLOAD
+        {
             return Ok((None, false));
+        }
+
+        if let Some(newest) = self.current_frame_seq.or(self.last_completed_seq) {
+            let behind = newest.wrapping_sub(hdr.frame_seq);
+            if behind == 0 {
+                if self.current_frame_seq.is_none() {
+                    return Ok((None, false));
+                }
+            } else if behind < (1u32 << 31) {
+                if behind <= STALE_SEQUENCE_WINDOW {
+                    return Ok((None, false));
+                }
+                // Far behind: the sender restarted its numbering. Resynchronise
+                // instead of discarding the new stream until it catches up.
+                self.current_frame_seq = None;
+                self.last_completed_seq = None;
+            }
         }
 
         let mut gap_detected = false;
@@ -243,35 +293,43 @@ impl VideoFrameAssembler {
                 }
             }
 
+            let count = usize::from(hdr.fragment_count);
             self.current_frame_seq = Some(hdr.frame_seq);
             self.expected_fragments = hdr.fragment_count;
             self.received_fragments = 0;
             self.is_keyframe = (hdr.flags & VIDEO_FLAG_KEYFRAME_IDR) != 0;
             self.codec = hdr.codec;
             self.capture_timestamp_ns = hdr.capture_timestamp_ns;
-            self.slots.clear();
-            self.slots.resize(hdr.fragment_count as usize, None);
+            self.received.clear();
+            self.received.resize(count, false);
+            self.data.clear();
+            self.data.resize(count * MAX_VIDEO_FRAGMENT_PAYLOAD, 0);
+            self.last_fragment_len = 0;
         }
 
-        let idx = hdr.fragment_index as usize;
-        if idx < self.slots.len() && self.slots[idx].is_none() {
-            self.slots[idx] = Some(payload.to_vec());
-            self.received_fragments += 1;
+        let idx = usize::from(hdr.fragment_index);
+        let last = idx + 1 == usize::from(self.expected_fragments);
+        // Every fragment except the last is full-sized; anything else is
+        // malformed and leaves the unit incomplete.
+        if hdr.fragment_count != self.expected_fragments
+            || self.received[idx]
+            || (!last && payload.len() != MAX_VIDEO_FRAGMENT_PAYLOAD)
+        {
+            return Ok((None, gap_detected));
         }
+        let offset = idx * MAX_VIDEO_FRAGMENT_PAYLOAD;
+        self.data[offset..offset + payload.len()].copy_from_slice(payload);
+        if last {
+            self.last_fragment_len = payload.len();
+        }
+        self.received[idx] = true;
+        self.received_fragments += 1;
 
         if self.received_fragments == self.expected_fragments {
-            let total_bytes: usize = self
-                .slots
-                .iter()
-                .filter_map(|s| s.as_ref().map(|v| v.len()))
-                .sum();
-            let mut data = Vec::with_capacity(total_bytes);
-            for slot in self.slots.iter_mut() {
-                if let Some(chunk) = slot.take() {
-                    data.extend_from_slice(&chunk);
-                }
-            }
-
+            let total = (usize::from(self.expected_fragments) - 1) * MAX_VIDEO_FRAGMENT_PAYLOAD
+                + self.last_fragment_len;
+            let mut data = std::mem::take(&mut self.data);
+            data.truncate(total);
             let frame = EncodedVideoFrame {
                 monitor_index: self.monitor_index,
                 codec: self.codec,
@@ -332,18 +390,19 @@ pub fn encode_bgrx_frame_to_bands(
         let band_px_count = (band_h as usize) * (frame_w as usize);
         let end_px = start_px + band_px_count;
 
-        let mut band_changed =
-            is_first || force_keyframe || ((u32::from(band_idx) + cycle_counter) % u32::from(num_bands) == 0);
+        let mut band_changed = is_first
+            || force_keyframe
+            || (u32::from(band_idx) + cycle_counter).is_multiple_of(u32::from(num_bands));
 
         // Convert BGRx -> RGB565 and check whether this horizontal band changed
-        for px_idx in start_px..end_px {
-            let off = px_idx * 4;
-            let b = u16::from(bgrx[off]);
-            let g = u16::from(bgrx[off + 1]);
-            let r = u16::from(bgrx[off + 2]);
+        let pixels = bgrx[start_px * 4..end_px * 4].as_chunks::<4>().0;
+        for (pixel, previous) in pixels.iter().zip(&mut prev_rgb565[start_px..end_px]) {
+            let b = u16::from(pixel[0]);
+            let g = u16::from(pixel[1]);
+            let r = u16::from(pixel[2]);
             let rgb565 = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
-            if prev_rgb565[px_idx] != rgb565 {
-                prev_rgb565[px_idx] = rgb565;
+            if *previous != rgb565 {
+                *previous = rgb565;
                 band_changed = true;
             }
         }
@@ -394,6 +453,9 @@ pub fn decode_band_into_bgrx(
     canvas_h: &mut u16,
     canvas_bgrx: &mut Vec<u8>,
 ) -> bool {
+    if data.len() >= 4 && data[..4] == crate::screen_codec::DPXC_BAND_MAGIC {
+        return crate::screen_codec::decode_native_band(data, canvas_w, canvas_h, canvas_bgrx);
+    }
     if data.len() < 12 || data[0..4] != DPXB_BAND_MAGIC {
         return false;
     }
@@ -403,7 +465,31 @@ pub fn decode_band_into_bgrx(
     let by = u16::from_be_bytes([data[8], data[9]]);
     let bh = u16::from_be_bytes([data[10], data[11]]);
 
-    if fw == 0 || fh == 0 || by >= fh || bh == 0 {
+    if fw == 0
+        || fh == 0
+        || by >= fh
+        || bh == 0
+        || u32::from(by) + u32::from(bh) > u32::from(fh)
+        || usize::from(fw) * usize::from(fh) > crate::screen_codec::MAX_CANVAS_PIXELS
+    {
+        return false;
+    }
+
+    let expected_pixels = usize::from(fw) * usize::from(bh);
+    let mut run_pixels = 0usize;
+    if !(data.len() - 12).is_multiple_of(3) {
+        return false;
+    }
+    for run in data[12..].as_chunks::<3>().0 {
+        if run[0] == 0 {
+            return false;
+        }
+        run_pixels += usize::from(run[0]);
+        if run_pixels > expected_pixels {
+            return false;
+        }
+    }
+    if run_pixels != expected_pixels {
         return false;
     }
 
@@ -488,17 +574,127 @@ mod tests {
         let mut prev = Vec::new();
         let mut seq = 0u32;
         let mut bands = Vec::new();
-        encode_bgrx_frame_to_bands(0, w, h, &src_bgrx, &mut prev, true, 0, &mut seq, 100, &mut bands);
+        encode_bgrx_frame_to_bands(
+            0, w, h, &src_bgrx, &mut prev, true, 0, &mut seq, 100, &mut bands,
+        );
         assert_eq!(bands.len(), 2);
 
         let mut dst_w = 0u16;
         let mut dst_h = 0u16;
         let mut dst_bgrx = Vec::new();
         for b in &bands {
-            assert!(decode_band_into_bgrx(&b.data, &mut dst_w, &mut dst_h, &mut dst_bgrx));
+            assert!(decode_band_into_bgrx(
+                &b.data,
+                &mut dst_w,
+                &mut dst_h,
+                &mut dst_bgrx
+            ));
         }
         assert_eq!(dst_w, w);
         assert_eq!(dst_h, h);
         assert_eq!(dst_bgrx.len(), src_bgrx.len());
+    }
+
+    #[test]
+    fn delayed_video_fragments_cannot_overwrite_a_newer_band() {
+        let mut assembler = VideoFrameAssembler::new(0);
+        let mut packets = Vec::new();
+        let mut frame = EncodedVideoFrame {
+            monitor_index: 0,
+            codec: VideoCodec::Hevc,
+            is_keyframe: false,
+            frame_seq: u32::MAX,
+            capture_timestamp_ns: 1,
+            data: vec![5; 30],
+        };
+        packetize_video_frame(&frame, &mut packets);
+        let old = packets[0].clone();
+        assert!(assembler.push_datagram(&old).unwrap().0.is_some());
+        frame.frame_seq = 0;
+        packetize_video_frame(&frame, &mut packets);
+        assert!(assembler.push_datagram(&packets[0]).unwrap().0.is_some());
+        assert_eq!(assembler.push_datagram(&old).unwrap(), (None, false));
+        assert_eq!(assembler.push_datagram(&packets[0]).unwrap(), (None, false));
+    }
+
+    #[test]
+    fn restarted_sender_resynchronises_but_late_duplicates_are_ignored() {
+        let mut assembler = VideoFrameAssembler::new(0);
+        let mut packets = Vec::new();
+        let mut frame = EncodedVideoFrame {
+            monitor_index: 0,
+            codec: VideoCodec::Tiles,
+            is_keyframe: false,
+            frame_seq: 5000,
+            capture_timestamp_ns: 1,
+            data: (0..4000).map(|i| i as u8).collect(),
+        };
+        let mut push = |assembler: &mut VideoFrameAssembler, frame: &EncodedVideoFrame| {
+            packetize_video_frame(frame, &mut packets);
+            packets
+                .iter()
+                .filter_map(|p| assembler.push_datagram(p).unwrap().0)
+                .next_back()
+        };
+        assert_eq!(push(&mut assembler, &frame).unwrap(), frame);
+        frame.frame_seq = 4990;
+        assert!(push(&mut assembler, &frame).is_none(), "late duplicate");
+        frame.frame_seq = 0;
+        assert_eq!(push(&mut assembler, &frame).unwrap(), frame, "new session");
+        frame.frame_seq = 1;
+        assert_eq!(push(&mut assembler, &frame).unwrap(), frame);
+    }
+
+    #[test]
+    fn short_middle_fragments_and_bad_indices_never_complete_a_unit() {
+        let frame = EncodedVideoFrame {
+            monitor_index: 1,
+            codec: VideoCodec::Tiles,
+            is_keyframe: true,
+            frame_seq: 9,
+            capture_timestamp_ns: 2,
+            data: vec![7; MAX_VIDEO_FRAGMENT_PAYLOAD * 2],
+        };
+        let mut packets = Vec::new();
+        packetize_video_frame(&frame, &mut packets);
+        let mut assembler = VideoFrameAssembler::new(1);
+        let mut short = packets[0].clone();
+        short.truncate(short.len() - 1);
+        assert!(assembler.push_datagram(&short).unwrap().0.is_none());
+        let mut bad_index = packets[1].clone();
+        bad_index[8..10].copy_from_slice(&7u16.to_be_bytes());
+        assert!(assembler.push_datagram(&bad_index).unwrap().0.is_none());
+        assert!(assembler.push_datagram(&packets[1]).unwrap().0.is_none());
+        // The correct first fragment completes the unit intact.
+        assert_eq!(assembler.push_datagram(&packets[0]).unwrap().0.unwrap(), frame);
+    }
+
+    #[test]
+    fn truncated_legacy_band_does_not_partially_paint_the_canvas() {
+        let mut previous = Vec::new();
+        let mut sequence = 0;
+        let mut frames = Vec::new();
+        encode_bgrx_frame_to_bands(
+            0,
+            64,
+            18,
+            &vec![90; 64 * 18 * 4],
+            &mut previous,
+            true,
+            0,
+            &mut sequence,
+            1,
+            &mut frames,
+        );
+        let mut canvas = vec![123; 64 * 18 * 4];
+        let original = canvas.clone();
+        let frame = &frames[0].data;
+        assert!(!decode_band_into_bgrx(
+            &frame[..frame.len() - 3],
+            &mut 64,
+            &mut 18,
+            &mut canvas
+        ));
+        assert_eq!(canvas, original);
     }
 }

@@ -7,17 +7,17 @@
 //! - Built-in deterministic `--self-test` verification suite
 
 mod net;
+pub mod pairing;
 
 use core::sync::atomic::Ordering;
 use duplex_pal::{
     create_input_backend, create_video_pipeline_backend, create_virtual_display_backend,
-    monotonic_now_ns, CapturedInputEvent, InputBackend, ShmWatchdog, VideoPipelineBackend,
-    VirtualDisplayBackend,
+    monotonic_now_ns, CapturedInputEvent, InputBackend, PeerVideoCaps, ShmWatchdog,
+    VideoPipelineBackend, VirtualDisplayBackend,
 };
 use duplex_proto::{
-    CursorTelemetry, DisplayDescriptor, EncodedVideoFrame, HidEvent, ModeStateMachine, NodeRole,
-    OperationalMode, TransitionReason, WirePayload, MAX_VIDEO_BITRATE_KBPS, NO_REQUESTED_MODE,
-    WATCHDOG_TIMEOUT_NS,
+    DisplayDescriptor, HidEvent, ModeStateMachine, NodeRole, OperationalMode, TransitionReason,
+    WirePayload, NO_REQUESTED_MODE, VIDEO_CAP_NATIVE_BANDS, VIDEO_CAP_TILES,
 };
 use net::{default_link_ips, resolve_psk_from_env, DuplexTransport};
 use std::env;
@@ -29,6 +29,14 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 const DISPLAY_ADVERTISE_INTERVAL_NS: u64 = 2_000_000_000; // 2 seconds
+/// Minimum spacing of refresh requests per monitor, so a burst of loss costs
+/// one full refresh rather than many.
+const VIDEO_REFRESH_INTERVAL_NS: u64 = 250_000_000;
+
+/// Check pairing before a GUI starts a background daemon so errors are visible.
+pub fn validate_link_key_config() -> Result<(), String> {
+    resolve_psk_from_env().map(|_| ())
+}
 
 struct CliConfig {
     role: NodeRole,
@@ -112,8 +120,8 @@ fn try_spawn_watchdog_coprocess() -> Option<Child> {
     match Command::new(&exe_path)
         .arg("--guard")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
     {
         Ok(child) => {
@@ -173,7 +181,24 @@ fn apply_mode_transition(
     peer_physical_displays: &[DisplayDescriptor],
     notify_peer: bool,
 ) {
+    if peer_epoch.is_none()
+        && target_mode != OperationalMode::Mode0Idle
+        && !matches!(
+            reason,
+            TransitionReason::HardwarePanicEscape | TransitionReason::WatchdogTimeout
+        )
+        && !transport
+            .as_ref()
+            .is_some_and(|net| net.has_recent_authenticated_peer(monotonic_now_ns()))
+    {
+        warn!(?target_mode, "Mode request rejected: no recent authenticated peer. Input remains local; check Ethernet, pairing, and the other daemon");
+        return;
+    }
+    if peer_epoch.is_some_and(|epoch| epoch <= state_machine.epoch()) {
+        return;
+    }
     let previous_mode = state_machine.current_mode();
+    let previous_epoch = state_machine.epoch();
     let effective_target =
         match state_machine.transition_with_epoch(target_mode, reason, peer_epoch) {
             Ok(mode) => mode,
@@ -182,6 +207,30 @@ fn apply_mode_transition(
                 return;
             }
         };
+
+    // Mode transitions are sent as a three-packet burst. Only the first changes
+    // resources; replaying setup closes viewers and can stall the heartbeat loop.
+    if previous_mode == effective_target
+        && !matches!(
+            reason,
+            TransitionReason::HardwarePanicEscape | TransitionReason::WatchdogTimeout
+        )
+    {
+        return;
+    }
+
+    let _transition_keepalive = transport.as_ref().and_then(|net| {
+        let shm_peer = shm.clone();
+        match net.transition_keepalive(previous_mode, previous_epoch, move |now| {
+            shm_peer.block().beat_peer(now);
+        }) {
+            Ok(worker) => Some(worker),
+            Err(error) => {
+                warn!(%error, "Transition control keepalive unavailable");
+                None
+            }
+        }
+    });
 
     let now_ns = monotonic_now_ns();
     let block = shm.block();
@@ -230,14 +279,65 @@ fn apply_mode_transition(
     if required_vdisplays > 0 {
         let target_specs = build_target_display_specs(required_vdisplays, peer_physical_displays);
         if let Err(e) = display_pal.sync_virtual_displays(&target_specs) {
-            warn!("VirtualDisplayBackend sync_virtual_displays reported warning: {e}");
+            error!("Virtual display setup failed: {e}");
+            if let Some(net) = transport {
+                let _ = net.send_control_payload(&WirePayload::OperationError {
+                    message: e.to_string(),
+                });
+            }
+            apply_mode_transition(
+                role,
+                state_machine,
+                OperationalMode::Mode0Idle,
+                TransitionReason::HardwarePanicEscape,
+                None,
+                shm,
+                input_pal,
+                display_pal,
+                video_pal,
+                transport,
+                local_physical_displays,
+                peer_physical_displays,
+                true,
+            );
+            return;
         }
         block.virtual_displays_active.store(
             display_pal.active_virtual_displays().len() as u8,
             Ordering::Release,
         );
-        if let Err(e) = video_pal.start_sender(&target_specs, MAX_VIDEO_BITRATE_KBPS) {
-            warn!("VideoPipelineBackend start_sender reported warning: {e}");
+        if let Some(net) = transport.as_ref() {
+            net.set_video_consumer(None);
+        }
+        let started = match transport.as_ref() {
+            Some(net) => video_pal.start_sender(&target_specs, net.video_sink()),
+            None => Err(duplex_pal::PalError::Network(
+                "The peer link is down; video cannot be sent".into(),
+            )),
+        };
+        if let Err(e) = started {
+            error!("Video sender setup failed: {e}");
+            if let Some(net) = transport {
+                let _ = net.send_control_payload(&WirePayload::OperationError {
+                    message: e.to_string(),
+                });
+            }
+            apply_mode_transition(
+                role,
+                state_machine,
+                OperationalMode::Mode0Idle,
+                TransitionReason::HardwarePanicEscape,
+                None,
+                shm,
+                input_pal,
+                display_pal,
+                video_pal,
+                transport,
+                local_physical_displays,
+                peer_physical_displays,
+                true,
+            );
+            return;
         }
     } else if expected_viewers > 0 {
         if !display_pal.active_virtual_displays().is_empty() {
@@ -246,10 +346,35 @@ fn apply_mode_transition(
         block.virtual_displays_active.store(0, Ordering::Release);
 
         let viewer_specs = build_target_display_specs(expected_viewers, local_physical_displays);
-        if let Err(e) = video_pal.start_viewer(&viewer_specs) {
-            warn!("VideoPipelineBackend start_viewer reported warning: {e}");
-        }
+        let consumer = match video_pal.start_viewer(&viewer_specs) {
+            Ok(consumer) => consumer,
+            Err(e) => {
+                error!("Video receiver setup failed: {e}");
+                if let Some(net) = transport {
+                    let _ = net.send_control_payload(&WirePayload::OperationError {
+                        message: e.to_string(),
+                    });
+                }
+                apply_mode_transition(
+                    role,
+                    state_machine,
+                    OperationalMode::Mode0Idle,
+                    TransitionReason::HardwarePanicEscape,
+                    None,
+                    shm,
+                    input_pal,
+                    display_pal,
+                    video_pal,
+                    transport,
+                    local_physical_displays,
+                    peer_physical_displays,
+                    true,
+                );
+                return;
+            }
+        };
         if let Some(ref mut net_tx) = transport {
+            net_tx.set_video_consumer(Some(consumer));
             for idx in 0..expected_viewers {
                 let _ = net_tx.send_control_payload(&WirePayload::VideoKeyframeRequest {
                     monitor_index: idx,
@@ -257,6 +382,9 @@ fn apply_mode_transition(
             }
         }
     } else {
+        if let Some(net) = transport.as_ref() {
+            net.set_video_consumer(None);
+        }
         let _ = video_pal.close_all_viewer_windows();
         if !display_pal.active_virtual_displays().is_empty() {
             let _ = display_pal.destroy_all_virtual_displays();
@@ -272,13 +400,21 @@ fn apply_mode_transition(
     if effective_target.should_capture_input(role) {
         if let Err(e) = input_pal.start_capture() {
             error!("Failed to start input capture for {effective_target:?}: {e}");
-            let _ = state_machine.transition(
+            apply_mode_transition(
+                role,
+                state_machine,
                 OperationalMode::Mode0Idle,
                 TransitionReason::HardwarePanicEscape,
+                None,
+                shm,
+                input_pal,
+                display_pal,
+                video_pal,
+                transport,
+                local_physical_displays,
+                peer_physical_displays,
+                true,
             );
-            block
-                .active_mode
-                .store(OperationalMode::Mode0Idle.as_u8(), Ordering::SeqCst);
             return;
         }
     }
@@ -386,9 +522,26 @@ pub fn run_daemon_with_args(args: &[String]) {
         "Initializing duplexd symmetric KVM, Virtual Display & Video daemon (Phase 5)"
     );
 
-    let shm = Arc::new(
-        ShmWatchdog::open(true).expect("Failed to initialize shared memory watchdog block"),
-    );
+    // Validate before touching input, displays, shared memory, or network sockets.
+    let psk = if cfg.self_test {
+        None
+    } else {
+        match resolve_psk_from_env() {
+            Ok(key) => Some(key),
+            Err(error) => {
+                error!("Cannot start daemon: {error}");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let shm = match ShmWatchdog::open(true) {
+        Ok(mapping) => Arc::new(mapping),
+        Err(error) => {
+            error!("Cannot start daemon: {error}");
+            std::process::exit(1);
+        }
+    };
 
     if cfg.self_test {
         run_phase5_self_test(&shm);
@@ -406,7 +559,9 @@ pub fn run_daemon_with_args(args: &[String]) {
     }
     let _ = video_pal.close_all_viewer_windows();
 
-    let local_physical_displays = display_pal.enumerate_physical_displays().unwrap_or_default();
+    let local_physical_displays = display_pal
+        .enumerate_physical_displays()
+        .unwrap_or_default();
     info!(
         local_monitors = local_physical_displays.len(),
         "Enumerated local physical displays for peer EDID advertisement"
@@ -416,22 +571,29 @@ pub fn run_daemon_with_args(args: &[String]) {
         create_input_backend(Some(shm.clone())).expect("Failed to create InputBackend");
     let _ = input_pal.release_all_stuck_keys();
 
-    let psk = resolve_psk_from_env();
-    let mut transport =
-        match DuplexTransport::bind_strict(cfg.role, cfg.local_ip, cfg.peer_ip, &psk) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                if cfg.check_only {
-                    warn!("Interface {} not yet up during --check-init: {e}", cfg.local_ip);
-                    return;
-                }
+    let psk = psk.expect("link key was validated before initialization");
+    let mut transport = match DuplexTransport::bind_strict(
+        cfg.role,
+        cfg.local_ip,
+        cfg.peer_ip,
+        &psk,
+    ) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            if cfg.check_only {
                 warn!(
-                    "Interface {} not yet up ({e}); starting in MODE_0_IDLE and retrying bind when cable connects",
+                    "Interface {} not yet up during --check-init: {e}",
                     cfg.local_ip
                 );
-                None
+                return;
             }
-        };
+            warn!(
+                    "Peer transport unavailable at {} ({e}); staying idle and retrying. Check the link address and whether another process owns the ports",
+                    cfg.local_ip
+                );
+            None
+        }
+    };
 
     let _guard_child = if cfg.spawn_guard && !cfg.check_only {
         try_spawn_watchdog_coprocess()
@@ -474,10 +636,11 @@ pub fn run_daemon_with_args(args: &[String]) {
     let mut captured_buf: Vec<CapturedInputEvent> = Vec::with_capacity(64);
     let mut outgoing_hid_buf: Vec<HidEvent> = Vec::with_capacity(64);
     let mut incoming_payloads: Vec<WirePayload> = Vec::with_capacity(32);
-    let mut encoded_video_buf: Vec<EncodedVideoFrame> = Vec::with_capacity(8);
-    let mut incoming_video_buf: Vec<EncodedVideoFrame> = Vec::with_capacity(8);
-    let mut pli_monitors_buf: Vec<u8> = Vec::with_capacity(4);
+    let mut refresh_monitors: Vec<u8> = Vec::with_capacity(4);
+    let mut last_refresh_request_ns = [0u64; 2];
+    let mut peer_video = PeerVideoCaps::default();
     let mut last_local_transition_ns: u64 = 0;
+    let mut last_input_error_ns: u64 = 0;
 
     loop {
         let now_ns = monotonic_now_ns();
@@ -485,28 +648,44 @@ pub fn run_daemon_with_args(args: &[String]) {
         let block = shm.block();
         block.beat_daemon(now_ns);
 
-        // Hot-plug retry: if the 1GbE link was unplugged at startup, attempt strict QoS bind every 1s
-        if transport.is_none() && now_ns.saturating_sub(last_bind_retry_ns) >= 1_000_000_000 {
+        // Address removal leaves old bound sockets alive. Drop them so reconnect
+        // rebuilds TCP and UDP state instead of retaining a dead connection.
+        if now_ns.saturating_sub(last_bind_retry_ns) >= 1_000_000_000 {
             last_bind_retry_ns = now_ns;
-            if let Ok(t) = DuplexTransport::bind_strict(cfg.role, cfg.local_ip, cfg.peer_ip, &psk) {
-                info!(
-                    local_ip = %cfg.local_ip,
-                    peer_ip = %cfg.peer_ip,
-                    "1GbE link carrier detected — strict QoS UDP/TCP transport bound"
-                );
-                transport = Some(t);
+            if transport.is_some() && !duplex_pal::local_link_address_available(cfg.local_ip) {
+                warn!(local_ip = %cfg.local_ip, "PC-link address disappeared; dropping stale transport and waiting for network reconnection");
+                transport = None;
+            }
+            if transport.is_none() {
+                if let Ok(t) =
+                    DuplexTransport::bind_strict(cfg.role, cfg.local_ip, cfg.peer_ip, &psk)
+                {
+                    info!(
+                        local_ip = %cfg.local_ip,
+                        peer_ip = %cfg.peer_ip,
+                        "PC-link address available — strict QoS UDP/TCP transport bound; waiting for authenticated peer"
+                    );
+                    transport = Some(t);
+                }
             }
         }
 
-        // Update peer_connected status based on 250ms peer heartbeat window
-        let peer_hb = block.peer_heartbeat_ns.load(Ordering::Acquire);
-        let peer_age = now_ns.saturating_sub(peer_hb);
-        block
-            .peer_connected
-            .store(peer_hb > 0 && peer_age <= WATCHDOG_TIMEOUT_NS, Ordering::Release);
+        // Transition grace timestamps are for the guard, not proof of a peer.
+        let connected = transport
+            .as_ref()
+            .is_some_and(|net| net.has_recent_authenticated_peer(now_ns));
+        let previously_connected = block.peer_connected.swap(connected, Ordering::AcqRel);
+        if previously_connected && !connected {
+            peer_video = PeerVideoCaps::default();
+            video_pal.set_peer_video_caps(peer_video);
+        }
 
-        // Periodically advertise our physical monitor EDIDs/specs so the peer can spawn matching virtual displays
-        if now_ns.saturating_sub(last_display_adv_ns) >= DISPLAY_ADVERTISE_INTERVAL_NS {
+        // Advertise displays and video capabilities immediately when a peer
+        // appears (so the first stream already uses the best codec), then
+        // periodically so the peer can spawn matching virtual displays.
+        if (connected && !previously_connected)
+            || now_ns.saturating_sub(last_display_adv_ns) >= DISPLAY_ADVERTISE_INTERVAL_NS
+        {
             last_display_adv_ns = now_ns;
             if let Some(ref mut net_io) = transport {
                 let adv = WirePayload::AdvertiseDisplays {
@@ -514,6 +693,62 @@ pub fn run_daemon_with_args(args: &[String]) {
                     displays: local_physical_displays.clone(),
                 };
                 let _ = net_io.send_control_payload(&adv);
+                let _ = net_io.send_control_payload(&WirePayload::VideoCapabilities {
+                    native_lossless: true,
+                });
+                let _ = net_io.send_control_payload(&WirePayload::VideoCapabilitiesV2 {
+                    codecs: VIDEO_CAP_NATIVE_BANDS | VIDEO_CAP_TILES,
+                });
+            }
+        }
+
+        // Video health: decoder/reassembly loss becomes a rate-limited refresh
+        // request; a failed capture helper or viewer ends the session loudly.
+        refresh_monitors.clear();
+        let video_health = video_pal.poll_health(&mut refresh_monitors);
+        if let Some(net_io) = transport.as_ref() {
+            let gaps = net_io.take_video_gaps();
+            refresh_monitors.extend((0..2u8).filter(|monitor| gaps & (1 << monitor) != 0));
+            let stats = net_io.video_stats();
+            block
+                .tx_video_frames
+                .store(stats.tx_units.load(Ordering::Relaxed), Ordering::Relaxed);
+            block
+                .rx_video_frames
+                .store(stats.rx_units.load(Ordering::Relaxed), Ordering::Relaxed);
+        }
+        if state_machine
+            .current_mode()
+            .expected_incoming_video_streams(cfg.role)
+            > 0
+        {
+            for &monitor in &refresh_monitors {
+                let slot = usize::from(monitor.min(1));
+                if now_ns.saturating_sub(last_refresh_request_ns[slot]) < VIDEO_REFRESH_INTERVAL_NS {
+                    continue;
+                }
+                last_refresh_request_ns[slot] = now_ns;
+                block
+                    .pli_keyframes_requested
+                    .fetch_add(1, Ordering::Relaxed);
+                if let Some(ref mut net_io) = transport {
+                    let _ = net_io.send_control_payload(&WirePayload::VideoKeyframeRequest {
+                        monitor_index: monitor,
+                    });
+                }
+            }
+        }
+        if let Err(error) = video_health {
+            if state_machine.current_mode() != OperationalMode::Mode0Idle {
+                error!(%error, "Video session failed; returning to Idle");
+                if let Some(ref mut net_io) = transport {
+                    let _ = net_io.send_control_payload(&WirePayload::OperationError {
+                        message: error.to_string(),
+                    });
+                }
+                block
+                    .requested_mode
+                    .store(OperationalMode::Mode0Idle.as_u8(), Ordering::Release);
             }
         }
 
@@ -539,7 +774,9 @@ pub fn run_daemon_with_args(args: &[String]) {
         }
 
         // 2. Check if duplex-ctl / GUI requested an operator mode transition via shared memory
-        let req = block.requested_mode.swap(NO_REQUESTED_MODE, Ordering::AcqRel);
+        let req = block
+            .requested_mode
+            .swap(NO_REQUESTED_MODE, Ordering::AcqRel);
         if req != NO_REQUESTED_MODE {
             let target_mode = OperationalMode::from_u8_lossy(req);
             last_local_transition_ns = now_ns;
@@ -565,25 +802,47 @@ pub fn run_daemon_with_args(args: &[String]) {
         outgoing_hid_buf.clear();
         let mut panic_tripped = None;
 
-        if let Ok(count) = input_pal.poll_captured_events(&mut captured_buf) {
-            if count > 0 {
-                for ev in &captured_buf {
-                    match *ev {
-                        CapturedInputEvent::Hid(hid_ev) => {
-                            outgoing_hid_buf.push(hid_ev);
-                        }
-                        CapturedInputEvent::PanicTriggered(kind) => {
-                            panic_tripped = Some(kind);
+        match input_pal.poll_captured_events(&mut captured_buf) {
+            Ok(count) => {
+                if count > 0 {
+                    for ev in &captured_buf {
+                        match *ev {
+                            CapturedInputEvent::Hid(hid_ev) => {
+                                outgoing_hid_buf.push(hid_ev);
+                            }
+                            CapturedInputEvent::PanicTriggered(kind) => {
+                                panic_tripped = Some(kind);
+                            }
                         }
                     }
                 }
+            }
+            Err(error) => {
+                if now_ns.saturating_sub(last_input_error_ns) >= 1_000_000_000 {
+                    last_input_error_ns = now_ns;
+                    error!(%error, "Local input capture failed; returning to Idle");
+                }
+                block
+                    .requested_mode
+                    .store(OperationalMode::Mode0Idle.as_u8(), Ordering::Release);
             }
         }
 
         if !outgoing_hid_buf.is_empty() {
             if let Some(ref mut net_tx) = transport {
-                if net_tx.send_hid_events(&outgoing_hid_buf, now_ns).is_ok() {
-                    block.tx_hid_packets.fetch_add(1, Ordering::Relaxed);
+                match net_tx.send_hid_events(&outgoing_hid_buf, now_ns) {
+                    Ok(()) => {
+                        block.tx_hid_packets.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        if now_ns.saturating_sub(last_input_error_ns) >= 1_000_000_000 {
+                            last_input_error_ns = now_ns;
+                            error!(%error, "Remote input send failed; returning to Idle");
+                        }
+                        block
+                            .requested_mode
+                            .store(OperationalMode::Mode0Idle.as_u8(), Ordering::Release);
+                    }
                 }
             }
         }
@@ -614,59 +873,34 @@ pub fn run_daemon_with_args(args: &[String]) {
             );
         }
 
-        // 4. Poll hardware-encoded HEVC video frames & decoupled 1000 Hz cursor telemetry
-        if state_machine.current_mode().should_stream_video(cfg.role) {
-            encoded_video_buf.clear();
-            let mut cursor_telemetry_opt: Option<CursorTelemetry> = None;
-            if let Ok(frame_count) =
-                video_pal.poll_encoded_frames(&mut encoded_video_buf, &mut cursor_telemetry_opt)
-            {
-                if let Some(ref mut net_tx) = transport {
-                    if let Some(cursor) = cursor_telemetry_opt.take() {
-                        let _ = net_tx.send_cursor_update(cursor);
-                    }
-                    if frame_count > 0 {
-                        for frame in &encoded_video_buf {
-                            net_tx.send_video_frame(frame);
-                        }
-                        block
-                            .tx_video_frames
-                            .fetch_add(frame_count as u64, Ordering::Relaxed);
-                    }
-                }
-            }
-        }
+        // A transition can take time; never send a pre-transition heartbeat timestamp.
+        let now_ns = monotonic_now_ns();
 
-        // 5. Tick 50 Hz CS6 (0xC0) Heartbeat & poll incoming encrypted HID/Control/Video frames
+        // 4. Tick 50 Hz CS6 (0xC0) heartbeat & poll incoming encrypted HID/control.
+        // Video has its own threads and never delays this loop.
         incoming_payloads.clear();
-        incoming_video_buf.clear();
-        pli_monitors_buf.clear();
-
         if let Some(ref mut net_io) = transport {
-            net_io.tick_heartbeat(
-                state_machine.current_mode(),
-                state_machine.epoch(),
-                now_ns,
-            );
+            net_io.tick_heartbeat(state_machine.current_mode(), state_machine.epoch(), now_ns);
             net_io.poll_incoming(&mut incoming_payloads);
-            net_io.poll_incoming_video(&mut incoming_video_buf, &mut pli_monitors_buf);
-
-            for mon_idx in pli_monitors_buf.drain(..) {
-                block.pli_keyframes_requested.fetch_add(1, Ordering::Relaxed);
-                let _ = net_io.send_control_payload(&WirePayload::VideoKeyframeRequest {
-                    monitor_index: mon_idx,
-                });
-            }
-        }
-
-        for frame in incoming_video_buf.drain(..) {
-            block.beat_peer(now_ns);
-            block.rx_video_frames.fetch_add(1, Ordering::Relaxed);
-            let _ = video_pal.submit_encoded_frame(&frame);
         }
 
         for payload in incoming_payloads.drain(..) {
             match payload {
+                WirePayload::OperationError { message } => {
+                    block.beat_peer(now_ns);
+                    error!(message = %message, "Peer operation failed");
+                }
+                WirePayload::VideoCapabilities { native_lossless } => {
+                    block.beat_peer(now_ns);
+                    peer_video.native_lossless = native_lossless;
+                    video_pal.set_peer_video_caps(peer_video);
+                }
+                WirePayload::VideoCapabilitiesV2 { codecs } => {
+                    block.beat_peer(now_ns);
+                    peer_video.native_lossless |= codecs & VIDEO_CAP_NATIVE_BANDS != 0;
+                    peer_video.tiles = codecs & VIDEO_CAP_TILES != 0;
+                    video_pal.set_peer_video_caps(peer_video);
+                }
                 WirePayload::HidBatch { events, .. } => {
                     block.beat_peer(now_ns);
                     block.rx_hid_packets.fetch_add(1, Ordering::Relaxed);
@@ -676,13 +910,22 @@ pub fn run_daemon_with_args(args: &[String]) {
 
                     for ev in &events {
                         if matches!(ev, HidEvent::ReleaseAllModifiers) || inject_allowed {
-                            let _ = input_pal.inject_hid_event(ev);
+                            if let Err(error) = input_pal.inject_hid_event(ev) {
+                                if now_ns.saturating_sub(last_input_error_ns) >= 1_000_000_000 {
+                                    last_input_error_ns = now_ns;
+                                    error!(%error, "Remote input injection failed; returning to Idle");
+                                }
+                                block
+                                    .requested_mode
+                                    .store(OperationalMode::Mode0Idle.as_u8(), Ordering::Release);
+                                break;
+                            }
                         }
                     }
                 }
-                WirePayload::CursorUpdate(cursor) => {
+                WirePayload::CursorUpdate(_) => {
+                    // Cursors are composited into the video by current senders.
                     block.beat_peer(now_ns);
-                    let _ = video_pal.update_hardware_cursor(&cursor);
                 }
                 WirePayload::Heartbeat {
                     sender_timestamp_ns,
