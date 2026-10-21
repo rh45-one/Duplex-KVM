@@ -1,6 +1,9 @@
 # Project to-do implementation and validation
 
-Updated: 2026-10-19.
+Updated: 2026-10-21.
+
+> [!NOTE]
+> Project status: Alpha / Beta. Duplex-KVM is currently in active development. Virtual display management, KVM input capture, and hardware acceleration are undergoing active testing and stabilization across hardware setups.
 
 ## Screen mirroring fixes implemented
 
