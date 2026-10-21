@@ -1064,4 +1064,41 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn test_live_public_release_fetch() {
+        let cfg = AppConfig::default();
+        let release = fetch_latest_release(&cfg)
+            .expect("Must fetch public release from GitHub without token");
+        assert_eq!(release.tag_name, "v1.0.1");
+        assert!(release.assets.iter().any(|a| a.name == expected_asset_name()));
+        assert!(release.assets.iter().any(|a| a.name == "SHA256SUMS.txt"));
+    }
+
+    #[test]
+    fn test_live_download_and_verify() {
+        let cfg = AppConfig::default();
+        let release = fetch_latest_release(&cfg).unwrap();
+        let expected = expected_asset_name();
+        let asset = release.assets.iter().find(|a| a.name == expected).unwrap();
+        let tmp_dir = env::temp_dir().join(format!("duplex-live-verify-{}", std::process::id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let dest = tmp_dir.join(expected);
+        download_file(
+            &asset.browser_download_url,
+            None,
+            "application/octet-stream",
+            &dest,
+        )
+        .unwrap();
+        verify_release_download(&dest, asset, &release.assets, |sums_asset| {
+            http_get(
+                &sums_asset.browser_download_url,
+                None,
+                "application/octet-stream",
+            )
+        })
+        .unwrap();
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 }
